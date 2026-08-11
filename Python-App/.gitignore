@@ -1,0 +1,9 @@
+logs/
+# Service account keys (do not commit)
+gcp-vision-credentials.json
+google-vision-key.json
+service-account.json
+id-scan-project-*.json
+# Per-machine Thales SDK paths (copy from thales_paths.example.ini)
+config/thales_paths.ini
+config/Application.ini

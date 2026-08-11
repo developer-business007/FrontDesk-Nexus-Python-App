@@ -1,0 +1,9 @@
+; Copy to Application.ini and point FDN_THALES_APPLICATION_INI at it.
+; Align sections with your Thales Document Reader SDK documentation.
+
+[DataToSend]
+Codeline=1
+CodelineData=1
+AAMVAData=1
+VisibleImage=0
+PhotoImage=0
