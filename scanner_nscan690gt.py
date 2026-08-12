@@ -19,15 +19,23 @@ import base64
 import io
 import json
 import logging
+import os
 import re
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
 logger = logging.getLogger(__name__)
 _HOST_DIR = Path(__file__).resolve().parent
 _DEFAULT_SAMPLE = _HOST_DIR / "samples" / "id_card.png"
+_LOG_TAG = "[nScan690gt]"
+
+
+def _log_step(msg: str, *args: Any) -> None:
+    """Always-visible milestone lines in native-host.log (prefix for easy grepping)."""
+    logger.info("%s " + msg, _LOG_TAG, *args)
 
 # Matches AAMVA three-letter field codes followed by value text.
 _AAMVA_FIELD_RE = re.compile(r'([A-Z]{3})([^\r\n]*)')
@@ -287,9 +295,104 @@ def _build_result(structured: dict[str, Any], image_b64: str, aamva_raw: str = "
 # ─────────────────────────────────────────────────────────────────────────────
 
 _TWAIN_SCAN_TIMEOUT_S = 55  # seconds to wait before declaring card pre-inserted / stuck
+_WORKER_HEARTBEAT_S = 5
 
 
 _WORKER_SCRIPT = _HOST_DIR / "scanner_twain_worker.py"
+
+
+def _resolve_host_log_path() -> Path | None:
+    """Same file the native host uses (env override or logs/native-host.log)."""
+    if os.environ.get("FDN_NO_LOG_FILE", "").strip().lower() in ("1", "true", "yes", "on"):
+        return None
+    explicit = os.environ.get("FDN_LOG_FILE", "").strip()
+    if explicit:
+        return Path(explicit)
+    return _HOST_DIR / "logs" / "native-host.log"
+
+
+def _run_twain_worker(*, timeout_s: int) -> subprocess.CompletedProcess[str]:
+    """
+    Spawn the TWAIN worker and log heartbeats while it waits for MSG_XFERREADY.
+    Worker stderr is mirrored into native-host.log as [nScan690gt][worker] lines.
+    """
+    log_path = _resolve_host_log_path()
+    env = os.environ.copy()
+    if log_path is not None:
+        env["FDN_NSCAN690GT_LOG_FILE"] = str(log_path.resolve())
+
+    _log_step(
+        "step1 START TWAIN worker — timeout=%ds path=%s python=%s",
+        timeout_s,
+        _WORKER_SCRIPT,
+        sys.executable,
+    )
+    _log_step(
+        "hint: blue LED ON usually means IDLE (SIP_LED_INDICATOR1_AUTO). "
+        "Motor/feed starts only after insert event → MSG_XFERREADY. "
+        "Remove card first, click Scan ID, then insert."
+    )
+
+    proc = subprocess.Popen(
+        [sys.executable, str(_WORKER_SCRIPT)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        cwd=str(_HOST_DIR),
+        env=env,
+    )
+    started = time.monotonic()
+    deadline = started + timeout_s
+    next_beat = started + _WORKER_HEARTBEAT_S
+
+    while True:
+        rc = proc.poll()
+        now = time.monotonic()
+        if rc is not None:
+            break
+        if now >= deadline:
+            _log_step(
+                "TIMEOUT after %ds — killing worker pid=%s (no MSG_XFERREADY / card not detected)",
+                timeout_s,
+                proc.pid,
+            )
+            try:
+                proc.kill()
+            except OSError:
+                pass
+            try:
+                _out, err = proc.communicate(timeout=5)
+            except Exception:  # noqa: BLE001
+                err = ""
+            if err and err.strip():
+                for line in err.strip().splitlines():
+                    logger.warning("%s [worker stderr] %s", _LOG_TAG, line)
+            raise subprocess.TimeoutExpired(proc.args, timeout_s)
+
+        if now >= next_beat:
+            elapsed = int(now - started)
+            remaining = max(0, int(deadline - now))
+            _log_step(
+                "WAITING for card/XFERREADY — elapsed=%ds remaining=%ds pid=%s",
+                elapsed,
+                remaining,
+                proc.pid,
+            )
+            next_beat = now + _WORKER_HEARTBEAT_S
+        time.sleep(0.25)
+
+    stdout, stderr = proc.communicate()
+    elapsed = int(time.monotonic() - started)
+    _log_step("TWAIN worker exited — rc=%s elapsed=%ds", proc.returncode, elapsed)
+    if stderr and stderr.strip():
+        for line in stderr.strip().splitlines():
+            logger.info("%s [worker] %s", _LOG_TAG, line)
+    return subprocess.CompletedProcess(
+        args=proc.args,
+        returncode=proc.returncode if proc.returncode is not None else -1,
+        stdout=stdout or "",
+        stderr=stderr or "",
+    )
 
 
 def scan_document(payload: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -302,28 +405,30 @@ def scan_document(payload: dict[str, Any] | None = None) -> dict[str, Any]:
            sends MSG_XFERREADY to the thread that called MSG_ENALEDS, which in a
            background thread has no proper HWND message loop. Running as a
            subprocess gives the TWAIN worker its own main thread.
-         • Pre-inserted card = no insertion event. subprocess.TimeoutExpired catches
+         • Pre-inserted card = no insertion event. TimeoutExpired catches
            this and returns a clear error instead of blocking the host forever.
       2. Decode PDF417/AAMVA barcode with zxingcpp (most US DL backs).
       3. If no barcode, fall back to Windows.Media.Ocr (offline, built-in).
       4. Return SDK_DOCUMENT_RESULT.
 
     Raises ScannerError on unrecoverable failures (propagated by main.py dispatch).
+
+    NOTE: Official Ambir path for this device is NS690gt.DLL + SI_OpenInterface("nScan690gt").
+    This module currently uses TWAIN (AmbirScanX), not the proprietary SI_* SDK.
     """
     from scanner import ScannerError, empty_id_fields, parse_id_fields
 
-    # ── 1. TWAIN scan (subprocess + timeout) ─────────────────────────────────
+    _log_step("========== SCAN START (engine=TWAIN, not NS690gt.DLL) ==========")
+    if payload:
+        _log_step("payload keys: %s", sorted(payload.keys()))
+
+    # ── 1. TWAIN scan (subprocess + timeout + heartbeats) ─────────────────────
     try:
-        proc = subprocess.run(
-            [sys.executable, str(_WORKER_SCRIPT)],
-            capture_output=True,
-            timeout=_TWAIN_SCAN_TIMEOUT_S,
-            text=True,
-            cwd=str(_HOST_DIR),
-        )
+        proc = _run_twain_worker(timeout_s=_TWAIN_SCAN_TIMEOUT_S)
     except subprocess.TimeoutExpired:
         logger.warning(
-            "nScan690gt: TWAIN timed out after %ds — card pre-inserted or scanner stuck",
+            "%s TWAIN timed out after %ds — card pre-inserted or scanner stuck",
+            _LOG_TAG,
             _TWAIN_SCAN_TIMEOUT_S,
         )
         raise ScannerError(
@@ -334,40 +439,64 @@ def scan_document(payload: dict[str, Any] | None = None) -> dict[str, Any]:
     stdout = (proc.stdout or "").strip()
     if proc.returncode != 0 or not stdout:
         err = (proc.stderr or "").strip() or "TWAIN worker exited with no output"
-        logger.warning("nScan690gt: TWAIN worker failed (rc=%d): %s", proc.returncode, err)
+        logger.warning("%s TWAIN worker failed (rc=%d): %s", _LOG_TAG, proc.returncode, err)
         raise ScannerError(err or "TWAIN scan failed")
 
     try:
         tw: dict[str, Any] = json.loads(stdout)
     except json.JSONDecodeError as exc:
+        _log_step("worker stdout was not JSON (first 200 chars): %r", stdout[:200])
         raise ScannerError(f"TWAIN worker returned invalid data: {exc}") from exc
+
+    _log_step(
+        "step1 RESULT type=%s source=%r simulated=%s keys=%s",
+        tw.get("type"),
+        tw.get("source_name"),
+        tw.get("simulated"),
+        sorted(tw.keys()),
+    )
+    if tw.get("simulated"):
+        logger.warning(
+            "%s WARNING: scan used SAMPLE image (simulated=true) — hardware did not capture. "
+            "Check AmbirScanX / TWAINDSM.dll / TWAIN source name containing '690gt'.",
+            _LOG_TAG,
+        )
     if tw.get("type") == "ERROR":
         raise ScannerError(str(tw.get("message") or "nScan 690gt scan failed"))
     image_b64 = (tw.get("image_base64") or "").strip()
     if not image_b64:
         raise ScannerError("nScan 690gt returned no image data")
 
-    logger.info(
-        "nScan690gt: TWAIN scan ok — source=%r simulated=%s chars=%d",
-        tw.get("source_name"),
-        tw.get("simulated"),
+    _log_step(
+        "step1 OK — image_base64 chars=%d (~%d bytes decoded)",
         len(image_b64),
+        len(image_b64) * 3 // 4,
     )
 
     raw_bytes = base64.b64decode(image_b64)
 
     # ── 2. Try PDF417 barcode (US DL back) ───────────────────────────────────
+    _log_step("step2 PDF417/AAMVA decode…")
     structured, aamva_raw = _try_pdf417(raw_bytes)
+    if structured:
+        _log_step(
+            "step2 OK barcode — doc=%r name=%r dob=%r",
+            structured.get("document_number"),
+            structured.get("full_name"),
+            structured.get("date_of_birth"),
+        )
+    else:
+        _log_step("step2 no AAMVA PDF417 — will try Windows OCR")
 
     # ── 3. Windows.Media.Ocr fallback ────────────────────────────────────────
     if not structured:
-        logger.info("nScan690gt: no barcode — falling back to Windows.Media.Ocr")
+        _log_step("step3 Windows.Media.Ocr…")
         raw_text = _try_windows_ocr(raw_bytes)
         if raw_text:
-            logger.info("nScan690gt: Windows OCR extracted %d chars", len(raw_text))
+            _log_step("step3 OK OCR — %d chars", len(raw_text))
             ocr_data = parse_id_fields(raw_text)
         else:
-            logger.warning("nScan690gt: Windows OCR returned no text — returning image with empty fields")
+            logger.warning("%s step3 OCR returned no text — empty fields + image only", _LOG_TAG)
             ocr_data = empty_id_fields()
         structured = {
             "first_name": ocr_data.get("firstName", ""),
@@ -391,4 +520,11 @@ def scan_document(payload: dict[str, Any] | None = None) -> dict[str, Any]:
         }
 
     # ── 4. Build and return result ────────────────────────────────────────────
-    return _build_result(structured, image_b64, aamva_raw)
+    result = _build_result(structured, image_b64, aamva_raw)
+    _log_step(
+        "========== SCAN DONE — engine=%s name=%r id=%r (front image only; back slot empty) ==========",
+        result.get("sdk_engine"),
+        result.get("full_name") or result.get("fullName"),
+        result.get("document_number") or result.get("idNumber"),
+    )
+    return result

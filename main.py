@@ -136,7 +136,10 @@ def _handle_scan_document_ambir(payload: dict[str, Any]) -> dict[str, Any]:
 
 def _handle_scan_document_nscan690gt(payload: dict[str, Any]) -> dict[str, Any]:
     """AMBIR nScan 690gt — TWAIN scan + zxingcpp PDF417/AAMVA or Windows.Media.Ocr."""
-    logger.info("[host] executing SCAN_DOCUMENT_NSCAN690GT handler (nScan 690gt)")
+    logger.info(
+        "[host] ========== SCAN_DOCUMENT_NSCAN690GT ========== "
+        "(nScan 690gt via TWAIN — not NS690gt.DLL SI_* API)"
+    )
     from scanner_nscan690gt import scan_document
     return scan_document(payload)
 
