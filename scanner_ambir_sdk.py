@@ -1,26 +1,24 @@
 """
-AMBIR scanner via ctypes — image acquisition only.
+AMBIR DocketPORT scanner via ctypes — image acquisition only.
 
-Hardware:
-  - nScan 690gt          → NS690gt.DLL  + SI_OpenInterface("nScan690gt")  [preferred for hotel ID]
-  - DocketPORT 467–687   → DPORT*.dll   + SI_OpenInterface("DocketPORT…")
-
-SDK: AMBIR SDK 2021 — model-specific DLL, all exports __cdecl.
+Hardware: AMBIR DocketPORT 467/468/487/488/667/687 USB document/ID feed scanner.
+SDK:      AMBIR SDK 2021 — model-specific DLL (e.g. DPORT487.dll), all exports __cdecl.
 
 Flow:
     OpenInterface → (calibration check) → WaitForPaper → SetProperties →
     StartScan → ReadImageData loop → EndScan → FeedPaperOut → CloseInterface
     → assemble BMP bytes → base64
 
-The DLL is NOT in the repo — it is installed by the AMBIR USB driver into
-C:\\Windows\\System32 (and SysWOW64). For 690gt that file is NS690gt.DLL.
+The DLL is NOT included in the SDK folder — it is installed by the AMBIR USB driver.
+After installing the driver, find the DLL (e.g. C:\\Windows\\System32\\DPORT487.dll)
+and point config/ambir_paths.ini [Paths] dll_path at it.
 
 Environment (each overrides the matching ini key):
-  FDN_AMBIR_DLL_PATH        — full path to NS690gt.DLL or DPORT*.dll
-  FDN_AMBIR_MODEL           — e.g. nScan690gt or DocketPORT487 (case-sensitive for OpenInterface)
+  FDN_AMBIR_DLL_PATH        — full path to DPORT*.dll
+  FDN_AMBIR_MODEL           — scanner model name, e.g. DocketPORT487
   FDN_AMBIR_RESOLUTION      — scan DPI (default 300)
   FDN_AMBIR_WAIT_TIMEOUT_S  — seconds to wait for paper (default 30)
-  FDN_AMBIR_DUPLEX          — 1/true to enable duplex when supported (default 1 for nScan690gt)
+
 Structure layout notes (64-bit Windows, __cdecl, #pragma pack(8)):
   SIValue  = 8-byte union (largest member = c_void_p on x64)
   SISingle = 16 bytes   (2 × SIValue)
@@ -49,10 +47,9 @@ _HOST_DIR = Path(__file__).resolve().parent
 _AMBIR_PATHS_INI = _HOST_DIR / "config" / "ambir_paths.ini"
 _ambir_paths_cache: configparser.ConfigParser | None | bool = False  # False = not yet read
 
-# Known models. nScan690gt first — hotel ID path. Then DocketPORT by capability.
-# OpenInterface model strings are case-sensitive (esp. "nScan690gt").
+# All DocketPORT models, highest-capability first (687 > 667 > 488 > 487 > 468 > 467).
+# The probe tries them in this order when no model is configured.
 _AMBIR_MODELS: list[tuple[str, str]] = [
-    ("nScan690gt", "NS690gt.DLL"),
     ("DocketPORT687", "DPORT687.dll"),
     ("DocketPORT667", "DPORT667.dll"),
     ("DocketPORT488", "DPORT488.dll"),
@@ -60,11 +57,6 @@ _AMBIR_MODELS: list[tuple[str, str]] = [
     ("DocketPORT468", "DPORT468.dll"),
     ("DocketPORT467", "DPORT467.dll"),
 ]
-
-# Property IDs used beyond the ID-scan defaults (ScannerAPI.h / 690gt addendum)
-SIP_DUPLEX_ENABLED = 21
-SIP_PREFEED_ENABLED = 50
-SIP_LED_INDICATOR1_AUTO = 41
 
 # ── SIResult codes (ScannerAPI.h) ────────────────────────────────────────────
 SIR_SUCCESS = 0
@@ -255,19 +247,7 @@ def _dll_name_for_model(model: str) -> str:
     for m, d in _AMBIR_MODELS:
         if m.lower() == model.lower():
             return d
-    if model.lower() == "nscan690gt":
-        return "NS690gt.DLL"
     return f"DPORT{model.replace('DocketPORT', '')}.dll"
-
-
-def _infer_model_from_dll_stem(stem: str) -> str | None:
-    u = stem.upper()
-    if u in ("NS690GT", "NS690GT_32"):
-        return "nScan690gt"
-    for m, d in _AMBIR_MODELS:
-        if d.upper().replace(".DLL", "") == u:
-            return m
-    return None
 
 
 def _system_dll_candidates() -> list[tuple[str, Path]]:
@@ -289,18 +269,20 @@ def _system_dll_candidates() -> list[tuple[str, Path]]:
     return found
 
 
-def _build_candidate_list(*, force_model: str | None = None) -> list[tuple[str, Path]]:
+def _build_candidate_list() -> list[tuple[str, Path]]:
     """Return ordered list of (model, dll_path) to try."""
     dll_path = _resolve_dll_path()
-    model_cfg = force_model or _resolve_model()
+    model_cfg = _resolve_model()
 
     if dll_path and model_cfg:
         return [(model_cfg, dll_path)]
 
     if dll_path:
-        inferred = _infer_model_from_dll_stem(dll_path.stem)
-        if inferred:
-            return [(inferred, dll_path)]
+        # Infer model from DLL stem (e.g. DPORT487 → DocketPORT487)
+        stem = dll_path.stem.upper()
+        for m, d in _AMBIR_MODELS:
+            if d.upper().replace(".DLL", "") == stem:
+                return [(m, dll_path)]
         # Unknown DLL name — use first model as placeholder
         return [(_AMBIR_MODELS[0][0], dll_path)]
 
@@ -314,15 +296,6 @@ def _build_candidate_list(*, force_model: str | None = None) -> list[tuple[str, 
             p = sd / dll_name
             if p.is_file():
                 return [(model_cfg, p)]
-        # Also try case variants Windows may use
-        for sd in [
-            Path(os.environ.get("SystemRoot", "C:/Windows")) / "System32",
-            Path(os.environ.get("SystemRoot", "C:/Windows")) / "SysWOW64",
-        ]:
-            for alt in ("NS690gt.DLL", "NS690GT.DLL", "ns690gt.dll"):
-                p = sd / alt
-                if model_cfg.lower() == "nscan690gt" and p.is_file():
-                    return [(model_cfg, p)]
 
     # Full auto-detect: try all known models from system dirs
     return _system_dll_candidates()
@@ -459,16 +432,18 @@ def _list_int_values(prop: SIProperty) -> list[int]:
 # Scanner configuration for ID scanning
 # ──────────────────────────────────────────────────────────────────────────────
 
-def _configure_id_scan(
-    dll: ctypes.CDLL,
-    target_dpi: int = 300,
-    *,
-    duplex: bool = False,
-) -> tuple[int, int, int, bool]:
+def _configure_id_scan(dll: ctypes.CDLL, target_dpi: int = 300) -> tuple[int, int, int]:
     """
     Configure the scanner for optimal ID card capture.
-    Returns (width_pixels, height_lines, bytes_per_line, duplex_enabled).
+    Returns (width_pixels, height_lines, bytes_per_line).
+
+    Strategy:
+    - RGB color at 300 DPI (ideal for Google Vision OCR on ID text)
+    - Full available width
+    - EOP detection enabled so feed stops at card edge automatically
+    - BGR channel order required by BMP format
     """
+    # ── Resolution ───────────────────────────────────────────────────────────
     chosen_dpi = target_dpi
     x_prop = _get_prop(dll, SIP_XRESOLUTION)
     available_dpi = _list_int_values(x_prop)
@@ -476,6 +451,7 @@ def _configure_id_scan(
         if target_dpi in available_dpi:
             chosen_dpi = target_dpi
         else:
+            # Pick the closest available DPI, preferring higher
             chosen_dpi = min(available_dpi, key=lambda x: abs(x - target_dpi))
         logger.info("AMBIR: available DPI=%s → chosen=%d", available_dpi, chosen_dpi)
 
@@ -490,53 +466,43 @@ def _configure_id_scan(
     else:
         _set_prop_single_int(dll, SIP_YRESOLUTION, chosen_dpi)
 
+    # ── Scan mode: RGB color ──────────────────────────────────────────────────
     mode_prop = _get_prop(dll, SIP_SCAN_MODE)
     if mode_prop.containerType == SICON_LIST:
         _set_prop_list_int(dll, mode_prop, SI_SCANMODE_RGB)
     else:
         _set_prop_single_int(dll, SIP_SCAN_MODE, SI_SCANMODE_RGB)
 
+    # ── Offsets to zero (full document area) ─────────────────────────────────
     _set_prop_single_int(dll, SIP_XOFFSET, 0)
     _set_prop_single_int(dll, SIP_YOFFSET, 0)
 
+    # ── Scan width: maximum available ────────────────────────────────────────
     w_prop = _get_prop(dll, SIP_SCAN_WIDTH_IN_PIXELS)
     if w_prop.containerType == SICON_RANGE:
         w_prop.range.current.iVal = w_prop.range.maximum.iVal
         dll.SI_SetProperty(byref(w_prop))
 
+    # ── Scan length: EOP detection (auto-stop at card edge) ──────────────────
+    # Enable EOP detect so the scan ends when the card exits the feed path.
     _set_prop_single_int(dll, SIP_EOP_DETECT_ENABLED, SI_TRUE)
 
+    # Also set a safe maximum scan length (6 inches covers any standard ID).
     h_prop = _get_prop(dll, SIP_SCAN_LENGTH_IN_LINES)
     if h_prop.containerType == SICON_RANGE:
         max_lines = h_prop.range.maximum.iVal
-        six_inch = min(6 * chosen_dpi, max_lines)
+        six_inch  = min(6 * chosen_dpi, max_lines)
         h_prop.range.current.iVal = six_inch
         dll.SI_SetProperty(byref(h_prop))
 
+    # ── Channel order: BGR (required by BMP format) ───────────────────────────
     co_prop = _get_prop(dll, SIP_CHANNEL_ORDER)
     if co_prop.containerType == SICON_LIST:
         _set_prop_list_int(dll, co_prop, SI_CO_BGR)
     else:
         _set_prop_single_int(dll, SIP_CHANNEL_ORDER, SI_CO_BGR)
 
-    # Prefeed grabs paper on insert (nScan 690gt / DocketPORT).
-    _set_prop_single_int(dll, SIP_PREFEED_ENABLED, SI_TRUE)
-
-    duplex_on = False
-    if duplex:
-        try:
-            dprop = _get_prop(dll, SIP_DUPLEX_ENABLED)
-            if dprop.containerType == SICON_SINGLE:
-                dprop.single.current.bVal = SI_TRUE
-                rc = dll.SI_SetProperty(byref(dprop))
-                if rc == SIR_SUCCESS:
-                    duplex_on = True
-                    logger.info("AMBIR: SIP_DUPLEX_ENABLED = TRUE")
-                else:
-                    logger.warning("AMBIR: could not enable duplex (rc=%#x)", rc)
-        except AmbirSDKError as exc:
-            logger.warning("AMBIR: duplex not available: %s", exc)
-
+    # ── Read back actual values ───────────────────────────────────────────────
     w_actual = _get_prop(dll, SIP_SCAN_WIDTH_IN_PIXELS)
     if w_actual.containerType == SICON_RANGE:
         width = w_actual.range.current.iVal
@@ -553,10 +519,10 @@ def _configure_id_scan(
     bytes_per_line = lw_prop.single.current.iVal
 
     logger.info(
-        "AMBIR: scan config → %d×%d px at %d DPI, %d bytes/line, duplex=%s",
-        width, height, chosen_dpi, bytes_per_line, duplex_on,
+        "AMBIR: scan config → %d×%d px at %d DPI, %d bytes/line",
+        width, height, chosen_dpi, bytes_per_line,
     )
-    return width, height, bytes_per_line, duplex_on
+    return width, height, bytes_per_line
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -566,108 +532,65 @@ def _configure_id_scan(
 _LINES_PER_READ = 16  # batch size for SI_ReadImageData — large enough to be efficient
 
 
-def _rows_to_bmp(width: int, all_rows: list[bytes], bytes_per_line: int) -> bytes:
-    row_stride = (bytes_per_line + 3) & ~3
-    actual_height = len(all_rows)
-    if actual_height == 0:
-        raise AmbirSDKError("Scanner returned 0 scan lines — confirm document is inserted and calibrated.")
-
-    # Ensure each stored row is stride-padded
-    padded: list[bytes] = []
-    for row in all_rows:
-        if len(row) < row_stride:
-            row = row + b"\x00" * (row_stride - len(row))
-        padded.append(row[:row_stride])
-
-    pixel_data = b"".join(padded)
-    pixel_size = len(pixel_data)
-    file_size = 14 + 40 + pixel_size
-    bfh = struct.pack("<2sIHHI", b"BM", file_size, 0, 0, 54)
-    bih = struct.pack(
-        "<IiiHHIIiiII",
-        40, width, -actual_height, 1, 24, 0, pixel_size, 0, 0, 0, 0,
-    )
-    return bfh + bih + pixel_data
-
-
-def _read_side_rows(
-    dll: ctypes.CDLL,
-    bytes_per_line: int,
-    page_number: int,
-) -> list[bytes]:
-    """Read one page/side after SI_StartScan until SIR_ENDOFDATA."""
-    row_stride = (bytes_per_line + 3) & ~3
-    buf = (c_uint8 * (row_stride * _LINES_PER_READ))()
-    all_rows: list[bytes] = []
-
-    while True:
-        lines_returned = c_uint32(0)
-        rc = dll.SI_ReadImageData(
-            ctypes.cast(buf, ctypes.c_void_p),
-            c_uint32(_LINES_PER_READ),
-            c_uint32(page_number),
-            ctypes.addressof(lines_returned),
-        )
-        n = lines_returned.value
-        if n > 0:
-            for i in range(n):
-                start = i * bytes_per_line
-                row = bytes(buf[start : start + bytes_per_line])
-                if row_stride > bytes_per_line:
-                    row += b"\x00" * (row_stride - bytes_per_line)
-                all_rows.append(row)
-
-        if rc == SIR_ENDOFDATA:
-            break
-        if rc != SIR_SUCCESS:
-            err = _get_error_text(dll)
-            raise AmbirSDKError(
-                f"SI_ReadImageData(page={page_number}) failed (code={rc:#x})"
-                + (f": {err}" if err else ""),
-                code=rc,
-            )
-        if n == 0:
-            time.sleep(0.01)
-
-    logger.info("AMBIR: page %d — %d lines", page_number, len(all_rows))
-    return all_rows
-
-
 def _scan_to_bmp_bytes(
     dll: ctypes.CDLL,
     width: int,
     height: int,
     bytes_per_line: int,
-    *,
-    duplex: bool = False,
-) -> tuple[bytes, bytes | None]:
+) -> bytes:
     """
-    SI_StartScan → read side 0 [+ side 1 if duplex] → SI_EndScan.
-    Returns (front_bmp, back_bmp_or_None).
+    Run the full StartScan → ReadImageData loop → EndScan sequence.
+    Assembles scan lines into a complete top-down 24-bit RGB BMP file.
+
+    BMP rows must be padded to 4-byte boundaries. A negative biHeight
+    value in the DIB header tells Windows the rows are stored top-to-bottom
+    (same order the scanner delivers them) — this avoids a row-reversal copy.
     """
-    del height  # configured max length; actual height comes from lines read
+    # Row stride padded to 4-byte boundary (required by BMP format)
+    row_stride = (bytes_per_line + 3) & ~3
+
+    buf = (c_uint8 * (row_stride * _LINES_PER_READ))()
+    all_rows: list[bytes] = []
+
     rc = dll.SI_StartScan()
     _check(dll, rc, "SI_StartScan")
-    logger.info("AMBIR: SI_StartScan OK — motor/feed should run (LED off while scanning)")
 
     scan_started = True
     try:
-        front_rows = _read_side_rows(dll, bytes_per_line, 0)
-        front_bmp = _rows_to_bmp(width, front_rows, bytes_per_line)
+        while True:
+            lines_returned = c_uint32(0)
+            rc = dll.SI_ReadImageData(
+                ctypes.cast(buf, ctypes.c_void_p),
+                c_uint32(_LINES_PER_READ),
+                c_uint32(0),
+                ctypes.addressof(lines_returned),
+            )
 
-        back_bmp: bytes | None = None
-        if duplex:
-            try:
-                back_rows = _read_side_rows(dll, bytes_per_line, 1)
-                if back_rows:
-                    back_bmp = _rows_to_bmp(width, back_rows, bytes_per_line)
-            except AmbirSDKError as exc:
-                logger.warning("AMBIR: duplex back side failed: %s", exc)
+            n = lines_returned.value
+            if n > 0:
+                for i in range(n):
+                    start = i * bytes_per_line
+                    row   = bytes(buf[start : start + bytes_per_line])
+                    if row_stride > bytes_per_line:
+                        row += b"\x00" * (row_stride - bytes_per_line)
+                    all_rows.append(row)
+
+            if rc == SIR_ENDOFDATA:
+                break
+            if rc != SIR_SUCCESS:
+                err = _get_error_text(dll)
+                raise AmbirSDKError(
+                    f"SI_ReadImageData failed (code={rc:#x})" + (f": {err}" if err else ""),
+                    code=rc,
+                )
+            if n == 0:
+                time.sleep(0.01)  # scanner is catching up; brief yield
 
         rc = dll.SI_EndScan()
         scan_started = False
         if rc != SIR_SUCCESS:
             logger.warning("AMBIR: SI_EndScan returned %d (non-fatal)", rc)
+
     except Exception:
         if scan_started:
             try:
@@ -676,14 +599,45 @@ def _scan_to_bmp_bytes(
                 pass
         raise
 
-    return front_bmp, back_bmp
+    actual_height = len(all_rows)
+    if actual_height == 0:
+        raise AmbirSDKError("Scanner returned 0 scan lines — confirm document is inserted and calibrated.")
+
+    logger.info("AMBIR: %d lines captured → assembling BMP", actual_height)
+
+    pixel_data = b"".join(all_rows)
+    pixel_size = len(pixel_data)
+    file_size  = 14 + 40 + pixel_size
+
+    # BITMAPFILEHEADER (14 bytes)
+    bfh = struct.pack(
+        "<2sIHHI",
+        b"BM",
+        file_size,
+        0, 0,   # reserved
+        54,     # pixel data offset (14 + 40)
+    )
+    # BITMAPINFOHEADER (40 bytes) — negative height = top-down row order
+    bih = struct.pack(
+        "<IiiHHIIiiII",
+        40,              # biSize
+        width,           # biWidth
+        -actual_height,  # biHeight  (negative → top-down, matches scanner delivery order)
+        1,               # biPlanes
+        24,              # biBitCount (RGB)
+        0,               # biCompression (BI_RGB = uncompressed)
+        pixel_size,      # biSizeImage
+        0, 0,            # XPelsPerMeter, YPelsPerMeter
+        0, 0,            # ClrUsed, ClrImportant
+    )
+    return bfh + bih + pixel_data
 
 
 # ──────────────────────────────────────────────────────────────────────────────
 # DLL open / close
 # ──────────────────────────────────────────────────────────────────────────────
 
-def _open_scanner(*, force_model: str | None = None) -> tuple[ctypes.CDLL, str, Path]:
+def _open_scanner() -> tuple[ctypes.CDLL, str, Path]:
     """
     Load DLL, bind exports, call SI_OpenInterface.
     Returns (dll, model_name, dll_path).
@@ -692,14 +646,14 @@ def _open_scanner(*, force_model: str | None = None) -> tuple[ctypes.CDLL, str, 
     if sys.platform != "win32":
         raise AmbirSDKError("AMBIR SDK is only supported on Windows.")
 
-    candidates = _build_candidate_list(force_model=force_model)
+    candidates = _build_candidate_list()
     if not candidates:
         raise AmbirSDKError(
             "AMBIR DLL not found. Steps:\n"
-            "  1. Install the AMBIR USB driver for your model (nScan 690gt → NS690gt.DLL).\n"
-            "  2. Confirm C:\\Windows\\System32\\NS690gt.DLL (or DPORT*.dll) exists.\n"
-            "  3. Optionally set FDN_AMBIR_DLL_PATH / FDN_AMBIR_MODEL or "
-            "config/ambir_paths.ini [Paths]."
+            "  1. Install the AMBIR DocketPORT USB driver from ambir.com.\n"
+            "  2. Find the installed DLL (e.g. C:\\Windows\\System32\\DPORT487.dll).\n"
+            "  3. Set FDN_AMBIR_DLL_PATH=<full_path> or add [Paths] dll_path in "
+            "config/ambir_paths.ini."
         )
 
     last_err: Exception = AmbirSDKError("No AMBIR candidate found.")
@@ -718,7 +672,6 @@ def _open_scanner(*, force_model: str | None = None) -> tuple[ctypes.CDLL, str, 
         except Exception:  # noqa: BLE001
             pass
 
-        # OpenInterface model string is case-sensitive (nScan690gt).
         rc = dll.SI_OpenInterface(model.encode("ascii"))
         if rc == SIR_SUCCESS or rc == SIR_ALREADY_OPEN:
             logger.info("AMBIR: opened %s from %s (rc=%#x)", model, dll_path, rc)
@@ -835,42 +788,38 @@ def scan_document_blocking(
     *,
     wait_timeout_s: int = 30,
     resolution: int = 300,
-    duplex: bool = False,
-    force_model: str | None = None,
 ) -> dict[str, Any]:
     """
     Full blocking scan cycle:
-      open → calibration check → wait for paper → configure → SI_StartScan → eject → close.
+      open → calibration check → wait for paper → configure → scan → eject → close.
 
     Returns:
         {
-            "image_base64": str,       # front BMP base64
-            "image_back_base64": str,  # back BMP base64 ("" if simplex)
-            "model": str,
-            "resolution": int,
-            "width": int,
-            "height": int,
-            "duplex": bool,
-            "dll_path": str,
+            "image_base64": str,  # base64-encoded BMP
+            "model":        str,
+            "resolution":   int,
+            "width":        int,
+            "height":       int,
         }
+
+    Raises:
+        AmbirSDKError — on DLL load failures, hardware errors, or timeout.
     """
-    dll, model, dll_path = _open_scanner(force_model=force_model)
+    dll, model, dll_path = _open_scanner()
     logger.info("AMBIR: scanner open — model=%s dll=%s", model, dll_path)
 
     try:
+        # Calibration check (warn only; do not block the scan)
         cal_state = c_uint32(0)
         rc = dll.SI_IsCalibrated(ctypes.addressof(cal_state))
         if rc == SIR_SUCCESS and cal_state.value == SI_FALSE:
             logger.warning(
                 "AMBIR: scanner not calibrated — scan quality may be degraded. "
-                "Calibrate via MiniScan / Ambir tools if OCR accuracy is poor. "
-                "690gt calib dir: C:\\ProgramData\\AmbirTechnology\\nScan690gt"
+                "Run calibration using the AMBIR calibration sheet if OCR accuracy is poor."
             )
 
-        logger.info(
-            "AMBIR: waiting up to %d s for document (SI_GetPaperStatus) — insert card now…",
-            wait_timeout_s,
-        )
+        # Wait for document
+        logger.info("AMBIR: waiting up to %d s for document insertion...", wait_timeout_s)
         deadline = time.monotonic() + wait_timeout_s
         while True:
             paper = c_uint32(0)
@@ -885,37 +834,32 @@ def scan_document_blocking(
                 )
             time.sleep(0.2)
 
-        logger.info("AMBIR: document detected — configuring scan properties…")
-        width, height, bytes_per_line, duplex_on = _configure_id_scan(
-            dll, target_dpi=resolution, duplex=duplex,
-        )
+        logger.info("AMBIR: document detected — configuring scan properties...")
+        width, height, bytes_per_line = _configure_id_scan(dll, target_dpi=resolution)
 
-        logger.info("AMBIR: calling SI_StartScan (this starts the feed motor)…")
-        front_bmp, back_bmp = _scan_to_bmp_bytes(
-            dll, width, height, bytes_per_line, duplex=duplex_on,
-        )
+        logger.info("AMBIR: starting scan...")
+        bmp_bytes = _scan_to_bmp_bytes(dll, width, height, bytes_per_line)
 
+        # Eject the document
         eject_rc = dll.SI_FeedPaperOut()
         if eject_rc != SIR_SUCCESS:
             logger.warning("AMBIR: SI_FeedPaperOut returned %#x (non-fatal)", eject_rc)
 
-        b64 = base64.b64encode(front_bmp).decode("ascii")
-        back_b64 = base64.b64encode(back_bmp).decode("ascii") if back_bmp else ""
-        actual_height = (len(front_bmp) - 54) // ((width * 3 + 3) & ~3)
+        b64 = base64.b64encode(bmp_bytes).decode("ascii")
         logger.info(
-            "AMBIR: scan complete — front=%d bytes back=%d bytes duplex=%s",
-            len(front_bmp), len(back_bmp or b""), duplex_on and bool(back_bmp),
+            "AMBIR: scan complete — BMP %d bytes, base64 %d chars",
+            len(bmp_bytes), len(b64),
         )
+
+        # Read actual scan height from assembled lines
+        actual_height = (len(bmp_bytes) - 54) // ((width * 3 + 3) & ~3)
 
         return {
             "image_base64": b64,
-            "image_back_base64": back_b64,
-            "model": model,
-            "resolution": resolution,
-            "width": width,
-            "height": actual_height,
-            "duplex": bool(back_bmp),
-            "dll_path": str(dll_path),
+            "model":        model,
+            "resolution":   resolution,
+            "width":        width,
+            "height":       actual_height,
         }
 
     finally:
@@ -925,45 +869,25 @@ def scan_document_blocking(
             logger.warning("AMBIR: SI_CloseInterface: %s", exc)
 
 
-def scan_document_safe(
-    *,
-    force_model: str | None = None,
-    duplex: bool | None = None,
-) -> dict[str, Any]:
+def scan_document_safe() -> dict[str, Any]:
     """
     Same as scan_document_blocking() but returns a result dict instead of raising.
 
     Return shapes:
-        {"type": "AMBIR_SCAN_OK",  "image_base64": ..., "image_back_base64": ..., ...}
-        {"type": "NO_DOCUMENT",    "message": ...}
-        {"type": "ERROR",          "message": ...}
+        {"type": "AMBIR_SCAN_OK",  "image_base64": ..., "model": ..., ...}
+        {"type": "NO_DOCUMENT",    "message": ...}   — timeout waiting for paper
+        {"type": "ERROR",          "message": ...}   — hardware / DLL failure
     """
     if sys.platform != "win32":
         return {"type": "ERROR", "message": "AMBIR SDK is only supported on Windows."}
     try:
         wait_s = int(os.environ.get("FDN_AMBIR_WAIT_TIMEOUT_S", "30").strip() or "30")
-        dpi = int(os.environ.get("FDN_AMBIR_RESOLUTION", "300").strip() or "300")
-        if duplex is None:
-            env_d = os.environ.get("FDN_AMBIR_DUPLEX", "").strip().lower()
-            if env_d in ("0", "false", "no", "off"):
-                duplex = False
-            elif env_d in ("1", "true", "yes", "on"):
-                duplex = True
-            else:
-                # Default: duplex on for nScan690gt, off for DocketPORT unless set
-                duplex = (force_model or "").lower() == "nscan690gt" or (
-                    not force_model and (_resolve_model() or "").lower() == "nscan690gt"
-                )
-        data = scan_document_blocking(
-            wait_timeout_s=wait_s,
-            resolution=dpi,
-            duplex=bool(duplex),
-            force_model=force_model,
-        )
+        dpi    = int(os.environ.get("FDN_AMBIR_RESOLUTION", "300").strip() or "300")
+        data   = scan_document_blocking(wait_timeout_s=wait_s, resolution=dpi)
         return {"type": "AMBIR_SCAN_OK", **data}
     except AmbirSDKError as exc:
         code = getattr(exc, "code", None)
-        msg = str(exc)
+        msg  = str(exc)
         if code == _ERR_CODE_TIMEOUT or "timeout" in msg.lower() or "no document" in msg.lower():
             return {"type": "NO_DOCUMENT", "message": msg}
         return {"type": "ERROR", "message": msg}

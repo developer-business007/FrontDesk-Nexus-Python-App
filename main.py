@@ -135,10 +135,10 @@ def _handle_scan_document_ambir(payload: dict[str, Any]) -> dict[str, Any]:
 
 
 def _handle_scan_document_nscan690gt(payload: dict[str, Any]) -> dict[str, Any]:
-    """AMBIR nScan 690gt — NS690gt.DLL SI_* scan + PDF417/AAMVA or Windows OCR."""
+    """AMBIR nScan 690gt — TWAIN scan + zxingcpp PDF417/AAMVA or Windows.Media.Ocr."""
     logger.info(
         "[host] ========== SCAN_DOCUMENT_NSCAN690GT ========== "
-        "(NS690gt.DLL / SI_OpenInterface('nScan690gt'))"
+        "(nScan 690gt via TWAIN — not NS690gt.DLL SI_* API)"
     )
     from scanner_nscan690gt import scan_document
     return scan_document(payload)
@@ -213,7 +213,7 @@ _COMMAND_HANDLERS: dict[str, CommandHandler] = {
     # Scanner commands
     "SCAN_DOCUMENT_SDK":        _handle_scan_document_sdk,        # Thales QS2000 (explicit)
     "SCAN_DOCUMENT_AMBIR":      _handle_scan_document_ambir,      # AMBIR DocketPORT (explicit)
-    "SCAN_DOCUMENT_NSCAN690GT": _handle_scan_document_nscan690gt, # AMBIR nScan 690gt NS690gt.DLL
+    "SCAN_DOCUMENT_NSCAN690GT": _handle_scan_document_nscan690gt, # AMBIR nScan 690gt TWAIN
     "SCAN_DOCUMENT_AUTO":       _handle_scan_document_auto,       # auto-detect: Thales → AMBIR
     "DEVICE_STATUS": _handle_device_status,
     "DISPENSE_CASH": _not_implemented("DISPENSE_CASH"),
@@ -519,20 +519,7 @@ def run() -> int:
     logger.info("FrontDesk Nexus Native Messaging host starting")
     logger.info("Proof file written: %s (if this exists, Chrome started Python)", _LAUNCH_SENTINEL)
 
-    # NOTE: Do NOT exit when stdin.isatty() is True.
-    # On Windows, Chrome often launches run-native-host.cmd with a console window,
-    # so isatty() can be True even for a real connectNative session. Exiting here
-    # breaks the extension after update.
-
     stdin, stdout = messaging.stdin_stdout_streams()
-    try:
-        tty = sys.stdin.isatty()
-    except Exception:  # noqa: BLE001
-        tty = False
-    logger.info(
-        "[host] entering native messaging loop (stdin_isatty=%s — True is OK on Windows .cmd)",
-        tty,
-    )
 
     stop_watch = threading.Event()
     watch_thread: threading.Thread | None = None

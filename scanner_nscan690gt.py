@@ -234,24 +234,16 @@ def _try_windows_ocr(raw_bytes: bytes) -> str:
 # Result builder
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _build_result(
-    structured: dict[str, Any],
-    image_b64: str,
-    aamva_raw: str = "",
-    *,
-    back_image_b64: str = "",
-    sdk_engine: str = "nscan690gt_si",
-) -> dict[str, Any]:
+def _build_result(structured: dict[str, Any], image_b64: str, aamva_raw: str = "") -> dict[str, Any]:
     """Build a SDK_DOCUMENT_RESULT dict from structured fields + image base64."""
     from scanner import sync_structured_document_fields_for_extension
 
     sync_structured_document_fields_for_extension(structured)
-    back = (back_image_b64 or "").strip()
 
     return {
         "type": "SDK_DOCUMENT_RESULT",
         "success": True,
-        "sdk_engine": sdk_engine,
+        "sdk_engine": "nscan690gt_twain",
         "vision_ocr_fallback": not bool(aamva_raw),
         "document_data": structured,
         "aamva_raw": aamva_raw,
@@ -276,7 +268,7 @@ def _build_result(
         "nationality": "",
         "mrz_raw": "",
         "barcode_data": structured.get("barcode_data", {}),
-        # camelCase aliases
+        # camelCase aliases (set by sync_structured_document_fields_for_extension)
         "fullName": structured.get("fullName", ""),
         "firstName": structured.get("firstName", ""),
         "middleName": structured.get("middleName", ""),
@@ -292,9 +284,9 @@ def _build_result(
         # image slots
         "image_base64": image_b64,
         "image_front_base64": image_b64,
-        "image_back_base64": back,
+        "image_back_base64": "",
         "front_image_base64": image_b64,
-        "back_image_base64": back,
+        "back_image_base64": "",
     }
 
 
@@ -405,81 +397,106 @@ def _run_twain_worker(*, timeout_s: int) -> subprocess.CompletedProcess[str]:
 
 def scan_document(payload: dict[str, Any] | None = None) -> dict[str, Any]:
     """
-    AMBIR nScan 690gt full scan pipeline (official SI_* API).
+    AMBIR nScan 690gt full scan pipeline.
 
-      1. Load NS690gt.DLL → SI_OpenInterface("nScan690gt")
-      2. Wait for paper (SI_GetPaperStatus) → configure → SI_StartScan (starts feed)
-      3. Read front [+ back if duplex] → SI_FeedPaperOut
-      4. Decode PDF417/AAMVA (prefer back image), else Windows.Media.Ocr
-      5. Return SDK_DOCUMENT_RESULT
-
-    Set FDN_NSCAN690GT_FORCE_TWAIN=1 to use the legacy TWAIN path (not recommended).
+      1. Acquire image via TWAIN subprocess with 55 s timeout.
+         • pytwain's modal loop requires the Windows message pump to run on the
+           process main thread. A daemon thread does not satisfy this — the scanner
+           sends MSG_XFERREADY to the thread that called MSG_ENALEDS, which in a
+           background thread has no proper HWND message loop. Running as a
+           subprocess gives the TWAIN worker its own main thread.
+         • Pre-inserted card = no insertion event. TimeoutExpired catches
+           this and returns a clear error instead of blocking the host forever.
+      2. Decode PDF417/AAMVA barcode with zxingcpp (most US DL backs).
+      3. If no barcode, fall back to Windows.Media.Ocr (offline, built-in).
+      4. Return SDK_DOCUMENT_RESULT.
 
     Raises ScannerError on unrecoverable failures (propagated by main.py dispatch).
+
+    NOTE: Official Ambir path for this device is NS690gt.DLL + SI_OpenInterface("nScan690gt").
+    This module currently uses TWAIN (AmbirScanX), not the proprietary SI_* SDK.
     """
     from scanner import ScannerError, empty_id_fields, parse_id_fields
 
-    force_twain = os.environ.get("FDN_NSCAN690GT_FORCE_TWAIN", "").strip().lower() in (
-        "1", "true", "yes", "on",
-    )
-    if force_twain:
-        return _scan_document_twain(payload)
-
-    _log_step("========== SCAN START (engine=NS690gt.DLL / SI_*) ==========")
+    _log_step("========== SCAN START (engine=TWAIN, not NS690gt.DLL) ==========")
     if payload:
         _log_step("payload keys: %s", sorted(payload.keys()))
 
-    from scanner_ambir_sdk import scan_document_safe
-
-    _log_step("step1 open NS690gt.DLL + wait for card + SI_StartScan…")
-    out = scan_document_safe(force_model="nScan690gt", duplex=True)
-
-    if out.get("type") == "NO_DOCUMENT":
-        raise ScannerError(
-            str(out.get("message") or "No card detected. Insert the ID after clicking Scan ID.")
+    # ── 1. TWAIN scan (subprocess + timeout + heartbeats) ─────────────────────
+    try:
+        proc = _run_twain_worker(timeout_s=_TWAIN_SCAN_TIMEOUT_S)
+    except subprocess.TimeoutExpired:
+        logger.warning(
+            "%s TWAIN timed out after %ds — card pre-inserted or scanner stuck",
+            _LOG_TAG,
+            _TWAIN_SCAN_TIMEOUT_S,
         )
-    if out.get("type") == "ERROR":
-        raise ScannerError(str(out.get("message") or "nScan 690gt SI scan failed"))
+        raise ScannerError(
+            "No card detected. Remove any card from the scanner, then click "
+            "Scan ID and insert the card within 55 seconds."
+        )
 
-    image_b64 = (out.get("image_base64") or "").strip()
-    back_b64 = (out.get("image_back_base64") or "").strip()
+    stdout = (proc.stdout or "").strip()
+    if proc.returncode != 0 or not stdout:
+        err = (proc.stderr or "").strip() or "TWAIN worker exited with no output"
+        logger.warning("%s TWAIN worker failed (rc=%d): %s", _LOG_TAG, proc.returncode, err)
+        raise ScannerError(err or "TWAIN scan failed")
+
+    try:
+        tw: dict[str, Any] = json.loads(stdout)
+    except json.JSONDecodeError as exc:
+        _log_step("worker stdout was not JSON (first 200 chars): %r", stdout[:200])
+        raise ScannerError(f"TWAIN worker returned invalid data: {exc}") from exc
+
+    _log_step(
+        "step1 RESULT type=%s source=%r simulated=%s keys=%s",
+        tw.get("type"),
+        tw.get("source_name"),
+        tw.get("simulated"),
+        sorted(tw.keys()),
+    )
+    if tw.get("simulated"):
+        logger.warning(
+            "%s WARNING: scan used SAMPLE image (simulated=true) — hardware did not capture. "
+            "Check AmbirScanX / TWAINDSM.dll / TWAIN source name containing '690gt'.",
+            _LOG_TAG,
+        )
+    if tw.get("type") == "ERROR":
+        raise ScannerError(str(tw.get("message") or "nScan 690gt scan failed"))
+    image_b64 = (tw.get("image_base64") or "").strip()
     if not image_b64:
         raise ScannerError("nScan 690gt returned no image data")
 
     _log_step(
-        "step1 OK — model=%r dll=%s duplex=%s front_chars=%d back_chars=%d",
-        out.get("model"),
-        out.get("dll_path"),
-        out.get("duplex"),
+        "step1 OK — image_base64 chars=%d (~%d bytes decoded)",
         len(image_b64),
-        len(back_b64),
+        len(image_b64) * 3 // 4,
     )
 
-    # Prefer barcode on back (PDF417), then front
-    structured = None
-    aamva_raw = ""
-    for label, b64 in (("back", back_b64), ("front", image_b64)):
-        if not b64:
-            continue
-        _log_step("step2 PDF417/AAMVA on %s image…", label)
-        structured, aamva_raw = _try_pdf417(base64.b64decode(b64))
-        if structured:
-            _log_step(
-                "step2 OK barcode on %s — doc=%r name=%r",
-                label,
-                structured.get("document_number"),
-                structured.get("full_name"),
-            )
-            break
+    raw_bytes = base64.b64decode(image_b64)
 
+    # ── 2. Try PDF417 barcode (US DL back) ───────────────────────────────────
+    _log_step("step2 PDF417/AAMVA decode…")
+    structured, aamva_raw = _try_pdf417(raw_bytes)
+    if structured:
+        _log_step(
+            "step2 OK barcode — doc=%r name=%r dob=%r",
+            structured.get("document_number"),
+            structured.get("full_name"),
+            structured.get("date_of_birth"),
+        )
+    else:
+        _log_step("step2 no AAMVA PDF417 — will try Windows OCR")
+
+    # ── 3. Windows.Media.Ocr fallback ────────────────────────────────────────
     if not structured:
-        _log_step("step3 Windows.Media.Ocr on front…")
-        raw_text = _try_windows_ocr(base64.b64decode(image_b64))
+        _log_step("step3 Windows.Media.Ocr…")
+        raw_text = _try_windows_ocr(raw_bytes)
         if raw_text:
             _log_step("step3 OK OCR — %d chars", len(raw_text))
             ocr_data = parse_id_fields(raw_text)
         else:
-            logger.warning("%s step3 OCR returned no text — empty fields + images", _LOG_TAG)
+            logger.warning("%s step3 OCR returned no text — empty fields + image only", _LOG_TAG)
             ocr_data = empty_id_fields()
         structured = {
             "first_name": ocr_data.get("firstName", ""),
@@ -502,71 +519,12 @@ def scan_document(payload: dict[str, Any] | None = None) -> dict[str, Any]:
             "barcode_data": {"source": "windows_ocr"},
         }
 
-    result = _build_result(
-        structured,
-        image_b64,
-        aamva_raw,
-        back_image_b64=back_b64,
-        sdk_engine="nscan690gt_si",
-    )
+    # ── 4. Build and return result ────────────────────────────────────────────
+    result = _build_result(structured, image_b64, aamva_raw)
     _log_step(
-        "========== SCAN DONE — engine=%s name=%r id=%r duplex_back=%s ==========",
+        "========== SCAN DONE — engine=%s name=%r id=%r (front image only; back slot empty) ==========",
         result.get("sdk_engine"),
         result.get("full_name") or result.get("fullName"),
         result.get("document_number") or result.get("idNumber"),
-        bool(back_b64),
     )
     return result
-
-
-def _scan_document_twain(payload: dict[str, Any] | None = None) -> dict[str, Any]:
-    """Legacy TWAIN path (EnableDS wait). Kept for emergency fallback only."""
-    from scanner import ScannerError, empty_id_fields, parse_id_fields
-
-    _log_step("========== SCAN START (engine=TWAIN FALLBACK) ==========")
-    try:
-        proc = _run_twain_worker(timeout_s=_TWAIN_SCAN_TIMEOUT_S)
-    except subprocess.TimeoutExpired:
-        raise ScannerError(
-            "No card detected (TWAIN). Prefer NS690gt.DLL path — unset FDN_NSCAN690GT_FORCE_TWAIN."
-        )
-
-    stdout = (proc.stdout or "").strip()
-    if proc.returncode != 0 or not stdout:
-        err = (proc.stderr or "").strip() or "TWAIN worker exited with no output"
-        raise ScannerError(err or "TWAIN scan failed")
-
-    tw: dict[str, Any] = json.loads(stdout)
-    if tw.get("type") == "ERROR":
-        raise ScannerError(str(tw.get("message") or "nScan 690gt TWAIN scan failed"))
-    image_b64 = (tw.get("image_base64") or "").strip()
-    if not image_b64:
-        raise ScannerError("nScan 690gt returned no image data")
-
-    structured, aamva_raw = _try_pdf417(base64.b64decode(image_b64))
-    if not structured:
-        raw_text = _try_windows_ocr(base64.b64decode(image_b64))
-        ocr_data = parse_id_fields(raw_text) if raw_text else empty_id_fields()
-        structured = {
-            "first_name": ocr_data.get("firstName", ""),
-            "middle_name": ocr_data.get("middleName", ""),
-            "last_name": ocr_data.get("lastName", ""),
-            "full_name": ocr_data.get("fullName", ""),
-            "document_number": ocr_data.get("idNumber", ""),
-            "document_type": ocr_data.get("idType", ""),
-            "date_of_birth": ocr_data.get("dateOfBirth", ""),
-            "expiry_date": ocr_data.get("expiryDate", ""),
-            "issue_date": ocr_data.get("issueDate", ""),
-            "address": ocr_data.get("address", ""),
-            "street_address": "",
-            "city": "",
-            "state": "",
-            "postal_code": "",
-            "gender": ocr_data.get("sex", ""),
-            "nationality": "",
-            "mrz_raw": "",
-            "barcode_data": {"source": "windows_ocr"},
-        }
-    return _build_result(
-        structured, image_b64, aamva_raw, sdk_engine="nscan690gt_twain",
-    )
