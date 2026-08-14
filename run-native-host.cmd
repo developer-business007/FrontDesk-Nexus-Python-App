@@ -8,9 +8,17 @@ cd /d "%~dp0"
 if not exist "%~dp0logs" mkdir "%~dp0logs"
 set "FDN_LOG_FILE=%~dp0logs\native-host.log"
 
-REM Automatic document flow: card on Thales reader -> host pushes AUTO_SCAN_RESULT (no button).
-REM Disable: set "FDN_THALES_AUTO_WATCH=0" below.
-set "FDN_THALES_AUTO_WATCH=1"
+REM ── nScan 690gt (Ambir) — hotel PC with NS690gt.DLL ─────────────────────────
+REM Auto/Manual mode is controlled by the extension (Auto / Manual buttons).
+REM Optional: start in Auto at host boot before extension connects:
+REM set "FDN_NSCAN690GT_AUTO_WATCH=1"
+set "FDN_NSCAN690GT_AUTO_WATCH=0"
+REM Manual Scan ID: extension Manual mode + Scan ID (SCAN_DOCUMENT_NSCAN690GT).
+REM Disable Thales auto-watch when using 690gt only:
+set "FDN_THALES_AUTO_WATCH=0"
+
+REM Automatic document flow (Thales QS2000 only — disabled above for 690gt hotels):
+REM set "FDN_THALES_AUTO_WATCH=1"
 
 REM Thales 3.9: Initialise has no ini path argument; copy host Application.ini into SDK Config
 REM so [DataToSend] (AAMVA, VisibleImage, etc.) matches your project. Set to 0 to use only the install default.

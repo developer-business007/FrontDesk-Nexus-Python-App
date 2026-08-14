@@ -1391,6 +1391,12 @@ def get_device_status() -> dict[str, Any]:
     except Exception as exc:  # noqa: BLE001
         ambir = {"available": False, "hw_ok": False, "model": "", "dll_path": "", "detail": str(exc)}
 
+    try:
+        from scanner_nscan690gt_sdk import probe_nscan690gt_sdk
+        nscan = probe_nscan690gt_sdk()
+    except Exception as exc:  # noqa: BLE001
+        nscan = {"available": False, "hw_ok": False, "dll_path": "", "detail": str(exc)}
+
     return {
         "type": "DEVICE_STATUS",
         # TWAIN
@@ -1407,6 +1413,11 @@ def get_device_status() -> dict[str, Any]:
         "ambir_model": ambir.get("model", ""),
         "ambir_dll_path": ambir.get("dll_path", ""),
         "ambir_detail": ambir.get("detail", ""),
+        # AMBIR nScan 690gt (NS690gt.DLL)
+        "nscan690gt_available": bool(nscan.get("available")),
+        "nscan690gt_hw_ok": bool(nscan.get("hw_ok")),
+        "nscan690gt_dll_path": nscan.get("dll_path", ""),
+        "nscan690gt_detail": nscan.get("detail", ""),
     }
 
 

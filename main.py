@@ -135,13 +135,63 @@ def _handle_scan_document_ambir(payload: dict[str, Any]) -> dict[str, Any]:
 
 
 def _handle_scan_document_nscan690gt(payload: dict[str, Any]) -> dict[str, Any]:
-    """AMBIR nScan 690gt — TWAIN scan + zxingcpp PDF417/AAMVA or Windows.Media.Ocr."""
+    """AMBIR nScan 690gt — NS690gt.DLL duplex scan + PDF417/OCR."""
     logger.info(
         "[host] ========== SCAN_DOCUMENT_NSCAN690GT ========== "
-        "(nScan 690gt via TWAIN — not NS690gt.DLL SI_* API)"
+        "(nScan 690gt via NS690gt.DLL SI_* API, manual mode)"
     )
     from scanner_nscan690gt import scan_document
     return scan_document(payload)
+
+
+_nscan690gt_stdout: BinaryIO | None = None
+_nscan690gt_watch_stop = threading.Event()
+_nscan690gt_watch_thread: threading.Thread | None = None
+_nscan690gt_mode = "manual"
+
+
+def _start_nscan690gt_auto_watch() -> None:
+    """Start (or restart) the nScan 690gt insert-card auto-watch loop."""
+    global _nscan690gt_watch_stop, _nscan690gt_watch_thread
+
+    if _nscan690gt_stdout is None:
+        logger.warning("[host] nScan690gt auto-watch: stdout not ready")
+        return
+
+    _nscan690gt_watch_stop.set()
+    if _nscan690gt_watch_thread is not None and _nscan690gt_watch_thread.is_alive():
+        _nscan690gt_watch_thread.join(timeout=3.0)
+
+    _nscan690gt_watch_stop = threading.Event()
+    _nscan690gt_watch_thread = threading.Thread(
+        target=_nscan690gt_auto_watch_thread,
+        args=(_nscan690gt_stdout, _nscan690gt_watch_stop),
+        name="nscan690gt-auto-watch",
+        daemon=True,
+    )
+    _nscan690gt_watch_thread.start()
+    logger.info("[host] nScan690gt auto-watch started (extension Auto mode)")
+
+
+def _stop_nscan690gt_auto_watch() -> None:
+    _nscan690gt_watch_stop.set()
+    logger.info("[host] nScan690gt auto-watch stop signaled (extension Manual mode)")
+
+
+def _handle_set_nscan690gt_scan_mode(payload: dict[str, Any]) -> dict[str, Any]:
+    """Extension Auto/Manual toggle for Ambir nScan 690gt."""
+    global _nscan690gt_mode
+
+    mode = payload.get("mode")
+    if mode not in ("auto", "manual"):
+        return _error('mode must be "auto" or "manual"')
+
+    _nscan690gt_mode = mode
+    if mode == "auto":
+        _start_nscan690gt_auto_watch()
+    else:
+        _stop_nscan690gt_auto_watch()
+    return {"type": "NSCAN690GT_SCAN_MODE", "success": True, "mode": mode}
 
 
 def _handle_scan_document_auto(payload: dict[str, Any]) -> dict[str, Any]:
@@ -213,7 +263,8 @@ _COMMAND_HANDLERS: dict[str, CommandHandler] = {
     # Scanner commands
     "SCAN_DOCUMENT_SDK":        _handle_scan_document_sdk,        # Thales QS2000 (explicit)
     "SCAN_DOCUMENT_AMBIR":      _handle_scan_document_ambir,      # AMBIR DocketPORT (explicit)
-    "SCAN_DOCUMENT_NSCAN690GT": _handle_scan_document_nscan690gt, # AMBIR nScan 690gt TWAIN
+    "SCAN_DOCUMENT_NSCAN690GT": _handle_scan_document_nscan690gt, # AMBIR nScan 690gt SDK
+    "SET_NSCAN690GT_SCAN_MODE": _handle_set_nscan690gt_scan_mode, # Ambir Auto / Manual
     "SCAN_DOCUMENT_AUTO":       _handle_scan_document_auto,       # auto-detect: Thales → AMBIR
     "DEVICE_STATUS": _handle_device_status,
     "DISPENSE_CASH": _not_implemented("DISPENSE_CASH"),
@@ -271,6 +322,11 @@ def _resolve_log_file_path(*, native_host: bool) -> Path | None:
 
 def _thales_auto_watch_enabled() -> bool:
     v = os.environ.get("FDN_THALES_AUTO_WATCH", "").strip().lower()
+    return v in ("1", "true", "yes", "on")
+
+
+def _nscan690gt_auto_watch_enabled() -> bool:
+    v = os.environ.get("FDN_NSCAN690GT_AUTO_WATCH", "").strip().lower()
     return v in ("1", "true", "yes", "on")
 
 
@@ -460,6 +516,63 @@ def _thales_auto_watch_thread(stdout: BinaryIO, stop: threading.Event) -> None:
     logger.info("[auto-watch] Thales background loop stopped")
 
 
+def _nscan690gt_auto_watch_thread(stdout: BinaryIO, stop: threading.Event) -> None:
+    """
+    AmbirScan Auto Scan behaviour: poll for card insertion, duplex scan, push AUTO_SCAN_RESULT.
+    Manual Scan ID still works via SCAN_DOCUMENT_NSCAN690GT (shared scanner lock in SDK module).
+    """
+    from scanner_nscan690gt import scan_document_auto_safe
+    from scanner_nscan690gt_sdk import SI_PS_PAPER_IN, SI_PS_PAPER_OUT, peek_paper_status
+
+    logger.info("[auto-watch] nScan 690gt background loop started (insert card → auto scan)")
+    poll_s = float(os.environ.get("FDN_NSCAN690GT_POLL_S", "0.35").strip() or "0.35")
+    cooldown_s = float(os.environ.get("FDN_NSCAN690GT_COOLDOWN_S", "8").strip() or "8")
+    backoff = 1.0
+    last_paper = SI_PS_PAPER_OUT
+
+    while not stop.is_set():
+        try:
+            paper_now = peek_paper_status()
+            if paper_now is None:
+                logger.warning("[auto-watch] nScan690gt: NS690gt.DLL not found — retrying in 10s")
+                time.sleep(10.0)
+                continue
+
+            inserted = last_paper == SI_PS_PAPER_OUT and paper_now == SI_PS_PAPER_IN
+            last_paper = paper_now
+
+            if not inserted:
+                time.sleep(poll_s)
+                continue
+
+            logger.info("[auto-watch] nScan690gt: card inserted — starting auto duplex scan")
+            payload = scan_document_auto_safe()
+            if payload.get("type") == "NO_DOCUMENT":
+                time.sleep(poll_s)
+                continue
+            if payload.get("type") == "ERROR":
+                logger.warning("[auto-watch] nScan690gt: %s", payload.get("message"))
+                time.sleep(min(backoff, 10.0))
+                backoff = min(backoff * 1.5, 10.0)
+                continue
+
+            backoff = 1.0
+            doc_num = (payload.get("document_data") or {}).get("document_number", "")
+            logger.info(
+                "[auto-watch] nScan690gt: pushing AUTO_SCAN_RESULT document_number=%r two_sided=%s",
+                doc_num,
+                payload.get("two_sided"),
+            )
+            _write_message_safe(stdout, payload)
+            logger.info("[auto-watch] nScan690gt: cooldown %.0f s (remove card)", cooldown_s)
+            time.sleep(cooldown_s)
+            last_paper = SI_PS_PAPER_OUT
+        except Exception:  # noqa: BLE001
+            logger.exception("[auto-watch] nScan690gt unexpected error")
+            time.sleep(2.0)
+    logger.info("[auto-watch] nScan690gt background loop stopped")
+
+
 def _configure_logging(*, native_host: bool) -> None:
     level = os.environ.get("FDN_LOG_LEVEL", "INFO").upper()
     fmt = "%(asctime)s %(levelname)s [%(name)s] %(message)s"
@@ -521,8 +634,11 @@ def run() -> int:
 
     stdin, stdout = messaging.stdin_stdout_streams()
 
+    global _nscan690gt_stdout
+    _nscan690gt_stdout = stdout
+
     stop_watch = threading.Event()
-    watch_thread: threading.Thread | None = None
+    watch_threads: list[threading.Thread] = []
     if _thales_auto_watch_enabled():
         _ini_paths = _HOST_ROOT / "config" / "thales_paths.ini"
         _app_ini = _HOST_ROOT / "config" / "Application.ini"
@@ -537,17 +653,27 @@ def run() -> int:
                 "Thales auto-watch expects %s - copy from Application.ini.example if missing.",
                 _app_ini,
             )
-        watch_thread = threading.Thread(
+        t = threading.Thread(
             target=_thales_auto_watch_thread,
             args=(stdout, stop_watch),
             name="thales-auto-watch",
             daemon=True,
         )
-        watch_thread.start()
+        t.start()
+        watch_threads.append(t)
         logger.info(
             "FDN_THALES_AUTO_WATCH is on - each successful Thales read pushes "
             "AUTO_SCAN_RESULT to the extension (listen on native port onMessage)."
         )
+
+    if _nscan690gt_auto_watch_enabled():
+        logger.info(
+            "FDN_NSCAN690GT_AUTO_WATCH is on — starting nScan690gt auto-watch at boot "
+            "(extension can override via SET_NSCAN690GT_SCAN_MODE)."
+        )
+        _start_nscan690gt_auto_watch()
+        if _nscan690gt_watch_thread is not None:
+            watch_threads.append(_nscan690gt_watch_thread)
 
     try:
         while True:
@@ -606,6 +732,7 @@ def run() -> int:
                 return 1
     finally:
         stop_watch.set()
+        _stop_nscan690gt_auto_watch()
 
 
 def _wants_native_messaging() -> bool:
