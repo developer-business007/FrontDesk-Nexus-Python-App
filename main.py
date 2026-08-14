@@ -135,10 +135,10 @@ def _handle_scan_document_ambir(payload: dict[str, Any]) -> dict[str, Any]:
 
 
 def _handle_scan_document_nscan690gt(payload: dict[str, Any]) -> dict[str, Any]:
-    """AMBIR nScan 690gt — TWAIN scan + zxingcpp PDF417/AAMVA or Windows.Media.Ocr."""
+    """AMBIR nScan 690gt — NS690gt.DLL SI_* scan + PDF417/AAMVA or Windows OCR."""
     logger.info(
         "[host] ========== SCAN_DOCUMENT_NSCAN690GT ========== "
-        "(nScan 690gt via TWAIN — not NS690gt.DLL SI_* API)"
+        "(NS690gt.DLL / SI_OpenInterface('nScan690gt'))"
     )
     from scanner_nscan690gt import scan_document
     return scan_document(payload)
@@ -213,7 +213,7 @@ _COMMAND_HANDLERS: dict[str, CommandHandler] = {
     # Scanner commands
     "SCAN_DOCUMENT_SDK":        _handle_scan_document_sdk,        # Thales QS2000 (explicit)
     "SCAN_DOCUMENT_AMBIR":      _handle_scan_document_ambir,      # AMBIR DocketPORT (explicit)
-    "SCAN_DOCUMENT_NSCAN690GT": _handle_scan_document_nscan690gt, # AMBIR nScan 690gt TWAIN
+    "SCAN_DOCUMENT_NSCAN690GT": _handle_scan_document_nscan690gt, # AMBIR nScan 690gt NS690gt.DLL
     "SCAN_DOCUMENT_AUTO":       _handle_scan_document_auto,       # auto-detect: Thales → AMBIR
     "DEVICE_STATUS": _handle_device_status,
     "DISPENSE_CASH": _not_implemented("DISPENSE_CASH"),
