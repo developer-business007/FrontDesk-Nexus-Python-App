@@ -519,7 +519,20 @@ def run() -> int:
     logger.info("FrontDesk Nexus Native Messaging host starting")
     logger.info("Proof file written: %s (if this exists, Chrome started Python)", _LAUNCH_SENTINEL)
 
+    # NOTE: Do NOT exit when stdin.isatty() is True.
+    # On Windows, Chrome often launches run-native-host.cmd with a console window,
+    # so isatty() can be True even for a real connectNative session. Exiting here
+    # breaks the extension after update.
+
     stdin, stdout = messaging.stdin_stdout_streams()
+    try:
+        tty = sys.stdin.isatty()
+    except Exception:  # noqa: BLE001
+        tty = False
+    logger.info(
+        "[host] entering native messaging loop (stdin_isatty=%s — True is OK on Windows .cmd)",
+        tty,
+    )
 
     stop_watch = threading.Event()
     watch_thread: threading.Thread | None = None
