@@ -94,6 +94,8 @@ SI_SCANMODE_RGB = 2
 SI_CO_BGR = 1       # BGR order required by BMP format
 SI_TRUE = 1
 SI_FALSE = 0
+# SIPaperStatus (ScannerAPI.h)
+SI_PS_PAPER_OUT = 0
 SI_PS_PAPER_IN = 1
 
 # Timeout sentinel code (used for error classification)

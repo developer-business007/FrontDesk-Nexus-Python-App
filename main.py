@@ -186,6 +186,7 @@ def _handle_set_nscan690gt_scan_mode(payload: dict[str, Any]) -> dict[str, Any]:
     if mode not in ("auto", "manual"):
         return _error('mode must be "auto" or "manual"')
 
+    logger.info("[host] SET_NSCAN690GT_SCAN_MODE mode=%r (was %r)", mode, _nscan690gt_mode)
     _nscan690gt_mode = mode
     if mode == "auto":
         _start_nscan690gt_auto_watch()
@@ -239,9 +240,17 @@ def _handle_scan_document_auto(payload: dict[str, Any]) -> dict[str, Any]:
 
 
 def _handle_device_status(_payload: dict[str, Any]) -> dict[str, Any]:
-    """TWAIN source list + Thales DLL probe (see scanner.get_device_status)."""
+    """TWAIN source list + Thales / AMBIR / nScan690gt probes (see scanner.get_device_status)."""
     logger.info("[host] executing DEVICE_STATUS")
-    return scanner.get_device_status()
+    status = scanner.get_device_status()
+    logger.info(
+        "[host] DEVICE_STATUS nscan690gt available=%s hw_ok=%s dll=%r detail=%s",
+        status.get("nscan690gt_available"),
+        status.get("nscan690gt_hw_ok"),
+        status.get("nscan690gt_dll_path"),
+        status.get("nscan690gt_detail"),
+    )
+    return status
 
 
 def _handle_rfid(payload: dict[str, Any]) -> dict[str, Any]:
@@ -521,33 +530,32 @@ def _nscan690gt_auto_watch_thread(stdout: BinaryIO, stop: threading.Event) -> No
     AmbirScan Auto Scan behaviour: poll for card insertion, duplex scan, push AUTO_SCAN_RESULT.
     Manual Scan ID still works via SCAN_DOCUMENT_NSCAN690GT (shared scanner lock in SDK module).
     """
-    from scanner_nscan690gt import scan_document_auto_safe
-    from scanner_nscan690gt_sdk import SI_PS_PAPER_IN, SI_PS_PAPER_OUT, peek_paper_status
+    logger.info("[auto-watch] nScan 690gt background loop starting…")
+    try:
+        from scanner_nscan690gt import scan_document_auto_safe
+        from scanner_nscan690gt_sdk import wait_for_card_insert
+    except Exception:  # noqa: BLE001
+        logger.exception(
+            "[auto-watch] nScan690gt import failed — Auto mode cannot run. "
+            "Deploy scanner_nscan690gt.py + scanner_nscan690gt_sdk.py + updated scanner_ambir_sdk.py"
+        )
+        return
 
     logger.info("[auto-watch] nScan 690gt background loop started (insert card → auto scan)")
     poll_s = float(os.environ.get("FDN_NSCAN690GT_POLL_S", "0.35").strip() or "0.35")
     cooldown_s = float(os.environ.get("FDN_NSCAN690GT_COOLDOWN_S", "8").strip() or "8")
     backoff = 1.0
-    last_paper = SI_PS_PAPER_OUT
 
     while not stop.is_set():
         try:
-            paper_now = peek_paper_status()
-            if paper_now is None:
-                logger.warning("[auto-watch] nScan690gt: NS690gt.DLL not found — retrying in 10s")
-                time.sleep(10.0)
-                continue
-
-            inserted = last_paper == SI_PS_PAPER_OUT and paper_now == SI_PS_PAPER_IN
-            last_paper = paper_now
-
-            if not inserted:
-                time.sleep(poll_s)
-                continue
+            inserted = wait_for_card_insert(poll_s=poll_s, stop_event=stop)
+            if not inserted or stop.is_set():
+                break
 
             logger.info("[auto-watch] nScan690gt: card inserted — starting auto duplex scan")
             payload = scan_document_auto_safe()
             if payload.get("type") == "NO_DOCUMENT":
+                logger.info("[auto-watch] nScan690gt: NO_DOCUMENT after insert edge — continue")
                 time.sleep(poll_s)
                 continue
             if payload.get("type") == "ERROR":
@@ -566,7 +574,6 @@ def _nscan690gt_auto_watch_thread(stdout: BinaryIO, stop: threading.Event) -> No
             _write_message_safe(stdout, payload)
             logger.info("[auto-watch] nScan690gt: cooldown %.0f s (remove card)", cooldown_s)
             time.sleep(cooldown_s)
-            last_paper = SI_PS_PAPER_OUT
         except Exception:  # noqa: BLE001
             logger.exception("[auto-watch] nScan690gt unexpected error")
             time.sleep(2.0)

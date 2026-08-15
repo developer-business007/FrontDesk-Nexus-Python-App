@@ -29,12 +29,9 @@ from scanner_ambir_sdk import (
     AmbirSDKError,
     SIR_ALREADY_OPEN,
     SIR_ENDOFDATA,
-    SIR_PROPERTY_UNSUPPORTED,
     SIR_SUCCESS,
     SI_CO_BGR,
     SI_FALSE,
-    SI_PS_PAPER_IN,
-    SI_PS_PAPER_OUT,
     SI_SCANMODE_RGB,
     SI_TRUE,
     SIP_CHANNEL_ORDER,
@@ -50,7 +47,6 @@ from scanner_ambir_sdk import (
     SICON_RANGE,
     SICON_LIST,
     SICON_SINGLE,
-    SIProperty,
     _ERR_CODE_TIMEOUT,
     _bind,
     _check,
@@ -69,6 +65,10 @@ _HOST_DIR = Path(__file__).resolve().parent
 # nScan 690gt addendum
 _OPEN_NAME = "nScan690gt"
 _DLL_NAMES = ("NS690gt.DLL", "NS690GT.DLL")
+
+# SIPaperStatus — defined here so we do not depend on ambir_sdk exporting them
+SI_PS_PAPER_OUT = 0
+SI_PS_PAPER_IN = 1
 
 # Property IDs (ScannerAPI.h + 690gt addendum)
 SIP_DUPLEX_ENABLED = 21
@@ -459,6 +459,9 @@ def peek_paper_status() -> int | None:
     """
     Quick paper check without scanning. Returns SI_PS_PAPER_IN / SI_PS_PAPER_OUT,
     or None when the DLL is unavailable.
+
+    Opens a short-lived SI_* session under the shared scanner lock so this never
+    races with Manual Scan ID / duplex capture.
     """
     dll_path = _resolve_dll_path()
     if dll_path is None:
@@ -469,11 +472,63 @@ def peek_paper_status() -> int | None:
             _bind(dll)
             _open_interface(dll)
             try:
-                return _paper_status(dll)
+                status = _paper_status(dll)
+                logger.debug("%s peek paper_status=%s", _LOG_TAG, status)
+                return status
             finally:
                 _close_interface(dll)
-        except AmbirSDKError:
+        except AmbirSDKError as exc:
+            logger.warning("%s peek_paper_status failed: %s", _LOG_TAG, exc)
             return None
+        except OSError as exc:
+            logger.warning("%s peek_paper_status OS error: %s", _LOG_TAG, exc)
+            return None
+
+
+def wait_for_card_insert(*, poll_s: float = 0.35, stop_event: threading.Event | None = None) -> bool:
+    """
+    Keep NS690gt.DLL open and poll until paper goes OUT→IN (AmbirScan Auto behaviour).
+
+    Returns True when a rising edge is seen, False if stop_event is set.
+    Caller should then call scan_auto_once() (which re-opens under the same lock).
+    """
+    dll_path = _resolve_dll_path()
+    if dll_path is None:
+        logger.warning("%s wait_for_card_insert: NS690gt.DLL not found", _LOG_TAG)
+        return False
+
+    last = SI_PS_PAPER_OUT
+    # Hold the lock for the whole wait so Manual cannot interleave mid-poll.
+    # Release periodically so Manual Scan ID can still run if staff switches mode.
+    while stop_event is None or not stop_event.is_set():
+        with _scanner_lock:
+            try:
+                dll = _load_dll(dll_path)
+                _bind(dll)
+                _open_interface(dll)
+                try:
+                    # Stay open for several polls — closer to MiniScan auto loop.
+                    for _ in range(20):
+                        if stop_event is not None and stop_event.is_set():
+                            return False
+                        paper_now = _paper_status(dll)
+                        inserted = last == SI_PS_PAPER_OUT and paper_now == SI_PS_PAPER_IN
+                        last = paper_now
+                        if inserted:
+                            logger.info("%s card insert edge detected (paper IN)", _LOG_TAG)
+                            return True
+                        time.sleep(poll_s)
+                finally:
+                    _close_interface(dll)
+            except AmbirSDKError as exc:
+                logger.warning("%s wait_for_card_insert: %s — retry in 2s", _LOG_TAG, exc)
+                time.sleep(2.0)
+            except OSError as exc:
+                logger.warning("%s wait_for_card_insert OS error: %s", _LOG_TAG, exc)
+                time.sleep(2.0)
+        # Brief unlock window for Manual scan between open sessions
+        time.sleep(0.05)
+    return False
 
 
 def probe_nscan690gt_sdk() -> dict[str, Any]:
