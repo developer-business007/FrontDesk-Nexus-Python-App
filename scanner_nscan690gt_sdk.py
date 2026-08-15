@@ -53,6 +53,7 @@ from scanner_ambir_sdk import (
     _get_error_text,
     _get_prop,
     _list_int_values,
+    _set_prop_bool,
     _set_prop_list_int,
     _set_prop_single_int,
 )
@@ -192,9 +193,10 @@ def _configure_id_scan(dll: ctypes.CDLL, *, target_dpi: int = 300) -> tuple[int,
 
     _set_prop_single_int(dll, SIP_XOFFSET, 0)
     _set_prop_single_int(dll, SIP_YOFFSET, 0)
-    _set_prop_single_int(dll, SIP_DUPLEX_ENABLED, SI_TRUE)
-    _set_prop_single_int(dll, SIP_PREFEED_ENABLED, SI_TRUE)
-    _set_prop_single_int(dll, SIP_EOP_DETECT_ENABLED, SI_TRUE)
+    # Duplex / prefeed / EOP are SI_BOOL — SI_INT32 returns 0x901 on nScan 690gt.
+    duplex_set = _set_prop_bool(dll, SIP_DUPLEX_ENABLED, True)
+    _set_prop_bool(dll, SIP_PREFEED_ENABLED, True)
+    _set_prop_bool(dll, SIP_EOP_DETECT_ENABLED, True)
 
     w_prop = _get_prop(dll, SIP_SCAN_WIDTH_IN_PIXELS)
     if w_prop.containerType == SICON_RANGE:
@@ -225,9 +227,16 @@ def _configure_id_scan(dll: ctypes.CDLL, *, target_dpi: int = 300) -> tuple[int,
     try:
         dx = _get_prop(dll, SIP_DUPLEX_ENABLED)
         if dx.containerType == SICON_SINGLE:
-            duplex_on = dx.single.current.iVal == SI_TRUE
+            duplex_on = (
+                dx.single.current.bVal == SI_TRUE
+                or dx.single.current.iVal == SI_TRUE
+            )
     except AmbirSDKError:
-        duplex_on = False
+        duplex_on = duplex_set
+
+    if duplex_set and not duplex_on:
+        # GetProperty lag — trust successful SetProperty
+        duplex_on = True
 
     logger.info(
         "%s configured %d×%d max lines, %d B/line, duplex=%s @ %d DPI",
@@ -543,29 +552,33 @@ def probe_nscan690gt_sdk() -> dict[str, Any]:
             "dll_path": "",
             "detail": "NS690gt.DLL not found. Install nScan 690gt driver.",
         }
-    try:
-        dll = _load_dll(dll_path)
-        _bind(dll)
-    except AmbirSDKError as exc:
-        return {"available": False, "hw_ok": False, "dll_path": str(dll_path), "detail": str(exc)}
 
-    hw_ok = False
-    note = "DLL loaded; hardware status unknown."
-    try:
-        _open_interface(dll)
-        hw_ok = True
-        note = f'nScan 690gt responded via SI_OpenInterface("{_OPEN_NAME}").'
-        _close_interface(dll)
-    except AmbirSDKError as exc:
-        note = f"DLL loaded; SI_OpenInterface failed: {exc}"
+    # Must take the same lock as scan/auto-watch so DEVICE_STATUS cannot
+    # SI_CloseInterface mid-poll / mid-scan (was causing 0x11 errors).
+    with _scanner_lock:
         try:
-            _close_interface(dll)
-        except Exception:  # noqa: BLE001
-            pass
+            dll = _load_dll(dll_path)
+            _bind(dll)
+        except AmbirSDKError as exc:
+            return {"available": False, "hw_ok": False, "dll_path": str(dll_path), "detail": str(exc)}
 
-    return {
-        "available": True,
-        "hw_ok": hw_ok,
-        "dll_path": str(dll_path),
-        "detail": note,
-    }
+        hw_ok = False
+        note = "DLL loaded; hardware status unknown."
+        try:
+            _open_interface(dll)
+            hw_ok = True
+            note = f'nScan 690gt responded via SI_OpenInterface("{_OPEN_NAME}").'
+            _close_interface(dll)
+        except AmbirSDKError as exc:
+            note = f"DLL loaded; SI_OpenInterface failed: {exc}"
+            try:
+                _close_interface(dll)
+            except Exception:  # noqa: BLE001
+                pass
+
+        return {
+            "available": True,
+            "hw_ok": hw_ok,
+            "dll_path": str(dll_path),
+            "detail": note,
+        }

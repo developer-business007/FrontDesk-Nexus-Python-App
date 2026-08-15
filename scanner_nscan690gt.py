@@ -123,48 +123,133 @@ def _parse_aamva(raw: str) -> dict[str, Any]:
 # zxingcpp PDF417 reader
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _is_aamva_text(text: str) -> bool:
+    t = text or ""
+    return (
+        t.startswith("@")
+        or "ANSI " in t
+        or "AAMVA" in t
+        or ("DAQ" in t and ("DCS" in t or "DAC" in t or "DBB" in t))
+    )
+
+
+def _pdf417_candidates_from_pil(img: Any) -> list[str]:
+    """Run zxingcpp on one PIL image; return candidate barcode texts."""
+    import zxingcpp
+
+    texts: list[str] = []
+    try:
+        fmt = getattr(zxingcpp, "BarcodeFormat", None)
+        pdf417 = getattr(fmt, "PDF417", None) if fmt is not None else None
+        if pdf417 is not None and hasattr(zxingcpp, "read_barcodes"):
+            try:
+                results = zxingcpp.read_barcodes(img, formats=pdf417)
+            except TypeError:
+                results = zxingcpp.read_barcodes(img)
+        else:
+            results = zxingcpp.read_barcodes(img)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("nScan690gt: zxingcpp.read_barcodes failed: %s", exc)
+        return texts
+
+    for r in results or []:
+        text = (getattr(r, "text", None) or "").strip()
+        if text:
+            texts.append(text)
+    return texts
+
+
 def _try_pdf417(raw_bytes: bytes) -> tuple[dict[str, Any] | None, str]:
     """
     Attempt PDF417 barcode decode on the scanned image.
     Returns (structured_dict, aamva_raw_text) on success, or (None, "") on failure.
     """
     try:
-        import zxingcpp
-        from PIL import Image
+        import zxingcpp  # noqa: F401
+        from PIL import Image, ImageOps
     except ImportError as exc:
-        logger.warning("nScan690gt: zxingcpp or Pillow not installed — skipping PDF417: %s", exc)
+        logger.warning(
+            "nScan690gt: zxingcpp or Pillow not installed — skipping PDF417: %s. "
+            "Install on hotel PC:  python -m pip install zxing-cpp Pillow",
+            exc,
+        )
         return None, ""
 
     try:
-        img = Image.open(io.BytesIO(raw_bytes)).convert("L")
-        results = zxingcpp.read_barcodes(img)
-        for r in results:
-            text = r.text or ""
-            is_pdf417 = getattr(r, "format", None) == getattr(zxingcpp, "BarcodeFormat", type(None)).PDF417  # type: ignore[attr-defined]
-            is_aamva = text.startswith("@") or "ANSI " in text or "DAQ" in text or "DCS" in text
-            if is_pdf417 and is_aamva:
-                structured = _parse_aamva(text)
-                if structured.get("document_number") and (structured.get("last_name") or structured.get("first_name")):
-                    logger.info(
-                        "nScan690gt: PDF417/AAMVA decoded — doc=%r name=%r dob=%r",
-                        structured.get("document_number"),
-                        structured.get("full_name"),
-                        structured.get("date_of_birth"),
-                    )
-                    return structured, text
-        logger.info("nScan690gt: no AAMVA PDF417 barcode found in image")
-        return None, ""
+        base = Image.open(io.BytesIO(raw_bytes))
     except Exception as exc:  # noqa: BLE001
-        logger.warning("nScan690gt: zxingcpp decode failed: %s", exc)
+        logger.warning("nScan690gt: cannot open scan image for PDF417: %s", exc)
         return None, ""
+
+    # Try original, grayscale, and a couple of scales / rotations — barcode may be
+    # on either side, rotated, or oversized at 300 DPI.
+    variants: list[Any] = []
+    gray = ImageOps.exif_transpose(base).convert("L")
+    variants.append(gray)
+    w, h = gray.size
+    for scale in (0.75, 0.5):
+        if max(w, h) * scale >= 400:
+            variants.append(
+                gray.resize((max(1, int(w * scale)), max(1, int(h * scale))), Image.Resampling.LANCZOS)
+            )
+    for angle in (180, 90, 270):
+        variants.append(gray.rotate(angle, expand=True))
+
+    seen: set[str] = set()
+    for img in variants:
+        for text in _pdf417_candidates_from_pil(img):
+            if text in seen:
+                continue
+            seen.add(text)
+            if not _is_aamva_text(text):
+                logger.info("nScan690gt: barcode found but not AAMVA (%d chars) — skip", len(text))
+                continue
+            structured = _parse_aamva(text)
+            if structured.get("document_number") or structured.get("last_name") or structured.get("first_name"):
+                logger.info(
+                    "nScan690gt: PDF417/AAMVA decoded — doc=%r name=%r dob=%r",
+                    structured.get("document_number"),
+                    structured.get("full_name"),
+                    structured.get("date_of_birth"),
+                )
+                return structured, text
+            logger.info("nScan690gt: AAMVA text parsed but empty key fields — continue")
+
+    logger.info("nScan690gt: no AAMVA PDF417 barcode found in image (%d variants tried)", len(variants))
+    return None, ""
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Windows.Media.Ocr fallback
 # ─────────────────────────────────────────────────────────────────────────────
 
+_OCR_MAX_EDGE = 1600  # downscale before WinOCR — full 300 DPI BMPs hang / time out
+_OCR_TIMEOUT_S = 25.0
+
+
+def _prepare_ocr_jpeg_bytes(raw_bytes: bytes) -> bytes:
+    """Downscale + JPEG-encode for faster Windows.Media.Ocr."""
+    from PIL import Image
+
+    img = Image.open(io.BytesIO(raw_bytes))
+    try:
+        from PIL import ImageOps
+        img = ImageOps.exif_transpose(img)
+    except Exception:  # noqa: BLE001
+        pass
+    img = img.convert("RGB")
+    w, h = img.size
+    longest = max(w, h)
+    if longest > _OCR_MAX_EDGE:
+        scale = _OCR_MAX_EDGE / float(longest)
+        img = img.resize((max(1, int(w * scale)), max(1, int(h * scale))), Image.Resampling.LANCZOS)
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=85)
+    return buf.getvalue()
+
+
 async def _ocr_async(image_bytes: bytes) -> str:
-    """Run Windows.Media.Ocr on raw image bytes. Async because WinRT APIs are async."""
+    """Run Windows.Media.Ocr on image bytes. Async because WinRT APIs are async."""
     from winrt.windows.graphics.imaging import BitmapDecoder
     from winrt.windows.media.ocr import OcrEngine
     from winrt.windows.storage.streams import DataWriter, InMemoryRandomAccessStream
@@ -194,25 +279,51 @@ async def _ocr_async(image_bytes: bytes) -> str:
 
 def _try_windows_ocr(raw_bytes: bytes) -> str:
     """
-    Run Windows.Media.Ocr synchronously.
-    Returns extracted text or "" on any error (missing package, unsupported OS, etc.).
+    Run Windows.Media.Ocr synchronously on a downscaled JPEG.
+    Returns extracted text or "" on any error / timeout.
     """
     try:
-        return asyncio.run(_ocr_async(raw_bytes))
+        ocr_bytes = _prepare_ocr_jpeg_bytes(raw_bytes)
+    except ImportError as exc:
+        logger.warning("nScan690gt: Pillow required for OCR preprocess: %s", exc)
+        ocr_bytes = raw_bytes
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("nScan690gt: OCR preprocess failed (%s) — using raw bytes", exc)
+        ocr_bytes = raw_bytes
+
+    logger.info(
+        "nScan690gt: Windows OCR start — input=%d bytes ocr_payload=%d bytes timeout=%.0fs",
+        len(raw_bytes),
+        len(ocr_bytes),
+        _OCR_TIMEOUT_S,
+    )
+
+    async def _run() -> str:
+        return await asyncio.wait_for(_ocr_async(ocr_bytes), timeout=_OCR_TIMEOUT_S)
+
+    try:
+        text = asyncio.run(_run())
+    except TimeoutError:
+        logger.warning("nScan690gt: Windows OCR timed out after %.0fs", _OCR_TIMEOUT_S)
+        return ""
     except RuntimeError as exc:
         msg = str(exc)
         if "running event loop" in msg.lower() or "This event loop is already running" in msg:
             try:
                 loop = asyncio.new_event_loop()
                 try:
-                    return loop.run_until_complete(_ocr_async(raw_bytes))
+                    text = loop.run_until_complete(_run())
                 finally:
                     loop.close()
+            except TimeoutError:
+                logger.warning("nScan690gt: Windows OCR timed out after %.0fs", _OCR_TIMEOUT_S)
+                return ""
             except Exception as exc2:  # noqa: BLE001
                 logger.warning("nScan690gt: Windows OCR (new loop) failed: %s", exc2)
                 return ""
-        logger.warning("nScan690gt: Windows OCR runtime error: %s", exc)
-        return ""
+        else:
+            logger.warning("nScan690gt: Windows OCR runtime error: %s", exc)
+            return ""
     except ImportError as exc:
         logger.warning("nScan690gt: winrt packages not installed — OCR unavailable: %s", exc)
         return ""
@@ -220,6 +331,9 @@ def _try_windows_ocr(raw_bytes: bytes) -> str:
         logger.warning("nScan690gt: Windows OCR failed: %s", exc)
         return ""
 
+    text = (text or "").strip()
+    logger.info("nScan690gt: Windows OCR done — %d chars", len(text))
+    return text
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Result builder
@@ -296,6 +410,12 @@ def _decode_from_images(front_b64: str, back_b64: str) -> tuple[dict[str, Any], 
     front_bytes = base64.b64decode(front_b64) if front_b64 else b""
     back_bytes = base64.b64decode(back_b64) if back_b64 else b""
 
+    _log_step(
+        "decode start — front=%d bytes back=%d bytes",
+        len(front_bytes),
+        len(back_bytes),
+    )
+
     structured, aamva_raw = None, ""
     for label, raw in (("back", back_bytes), ("front", front_bytes)):
         if not raw:
@@ -321,6 +441,12 @@ def _decode_from_images(front_b64: str, back_b64: str) -> tuple[dict[str, Any], 
 
     if combined_text:
         ocr_data = parse_id_fields(combined_text)
+        _log_step(
+            "OCR fields — name=%r %r id=%r",
+            ocr_data.get("firstName"),
+            ocr_data.get("lastName"),
+            ocr_data.get("idNumber"),
+        )
     else:
         logger.warning("%s OCR returned no text — empty fields + images only", _LOG_TAG)
         ocr_data = empty_id_fields()

@@ -90,6 +90,7 @@ SICON_SINGLE = 0
 SICON_RANGE = 1
 SICON_LIST = 2
 SI_INT32 = 1
+SI_BOOL = 7
 SI_SCANMODE_RGB = 2
 SI_CO_BGR = 1       # BGR order required by BMP format
 SI_TRUE = 1
@@ -402,6 +403,42 @@ def _set_prop_single_int(dll: ctypes.CDLL, prop_id: int, value: int) -> None:
     elif rc != SIR_SUCCESS:
         err = _get_error_text(dll)
         logger.warning("AMBIR: SI_SetProperty id=%d rc=%#x %s", prop_id, rc, err)
+
+
+def _set_prop_bool(dll: ctypes.CDLL, prop_id: int, enabled: bool) -> bool:
+    """
+    Set a SI_BOOL property the SDK-sample way: SI_GetProperty → mutate bVal → SI_SetProperty.
+
+    Duplex / EOP / Prefeed on nScan 690gt reject SI_INT32 (0x901); they require SI_BOOL.
+    Returns True when the property is set successfully.
+    """
+    try:
+        prop = _get_prop(dll, prop_id)
+    except AmbirSDKError as exc:
+        logger.debug("AMBIR: SI_GetProperty id=%d for bool set failed: %s", prop_id, exc)
+        return False
+
+    if prop.containerType != SICON_SINGLE:
+        logger.warning(
+            "AMBIR: SI_SetProperty id=%d expected SICON_SINGLE, got %s — skipping",
+            prop_id,
+            prop.containerType,
+        )
+        return False
+
+    # Keep container/item types from GetProperty; SDK samples only change bVal.
+    prop.itemType = SI_BOOL
+    prop.single.current.bVal = SI_TRUE if enabled else SI_FALSE
+    prop.single.current.iVal = SI_TRUE if enabled else SI_FALSE
+    rc = dll.SI_SetProperty(byref(prop))
+    if rc == SIR_PROPERTY_UNSUPPORTED:
+        logger.debug("AMBIR: SI_SetProperty id=%d (bool) unsupported — skipping", prop_id)
+        return False
+    if rc != SIR_SUCCESS:
+        err = _get_error_text(dll)
+        logger.warning("AMBIR: SI_SetProperty id=%d (bool) rc=%#x %s", prop_id, rc, err)
+        return False
+    return True
 
 
 def _set_prop_list_int(dll: ctypes.CDLL, prop: SIProperty, value: int) -> None:

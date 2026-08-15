@@ -1,3 +1,10 @@
 google-cloud-vision>=3.4.0
 pytwain>=2.3.0
 Pillow>=10.0.0
+# PDF417 / AAMVA barcode decode for nScan 690gt (import name: zxingcpp)
+zxing-cpp>=2.2.0
+# Optional Windows.Media.Ocr fallback (nScan 690gt when barcode missing)
+winrt-runtime>=2.0.0
+winrt-Windows.Graphics.Imaging>=2.0.0
+winrt-Windows.Media.Ocr>=2.0.0
+winrt-Windows.Storage.Streams>=2.0.0
