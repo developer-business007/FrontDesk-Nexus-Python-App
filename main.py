@@ -149,6 +149,10 @@ _nscan690gt_watch_stop = threading.Event()
 _nscan690gt_watch_thread: threading.Thread | None = None
 _nscan690gt_mode = "manual"
 
+_thales_watch_stop = threading.Event()
+_thales_watch_thread: threading.Thread | None = None
+_active_scanner: str = "twain"
+
 
 def _start_nscan690gt_auto_watch() -> None:
     """Start (or restart) the nScan 690gt insert-card auto-watch loop."""
@@ -178,6 +182,54 @@ def _stop_nscan690gt_auto_watch() -> None:
     logger.info("[host] nScan690gt auto-watch stop signaled (extension Manual mode)")
 
 
+def _start_thales_auto_watch() -> None:
+    """Start (or restart) the Thales QS2000 insert-document auto-watch loop."""
+    global _thales_watch_stop, _thales_watch_thread
+
+    if _nscan690gt_stdout is None:
+        logger.warning("[host] Thales auto-watch: stdout not ready")
+        return
+
+    _thales_watch_stop.set()
+    if _thales_watch_thread is not None and _thales_watch_thread.is_alive():
+        _thales_watch_thread.join(timeout=3.0)
+
+    _thales_watch_stop = threading.Event()
+    _thales_watch_thread = threading.Thread(
+        target=_thales_auto_watch_thread,
+        args=(_nscan690gt_stdout, _thales_watch_stop),
+        name="thales-auto-watch",
+        daemon=True,
+    )
+    _thales_watch_thread.start()
+    logger.info("[host] Thales auto-watch started (QS2000 selected)")
+
+
+def _stop_thales_auto_watch() -> None:
+    _thales_watch_stop.set()
+    logger.info("[host] Thales auto-watch stop signaled")
+
+
+def _handle_set_active_scanner(payload: dict[str, Any]) -> dict[str, Any]:
+    """Extension dropdown: Thales QS2000 vs nScan 690gt — only one auto-watch at a time."""
+    global _active_scanner
+
+    scanner = payload.get("scanner")
+    if scanner not in ("thales", "twain"):
+        return _error('scanner must be "thales" or "twain"')
+
+    logger.info("[host] SET_ACTIVE_SCANNER scanner=%r (was %r)", scanner, _active_scanner)
+    _active_scanner = scanner
+    if scanner == "thales":
+        _stop_nscan690gt_auto_watch()
+        _start_thales_auto_watch()
+    else:
+        _stop_thales_auto_watch()
+        if _nscan690gt_mode == "auto":
+            _start_nscan690gt_auto_watch()
+    return {"type": "ACTIVE_SCANNER", "success": True, "scanner": scanner}
+
+
 def _handle_set_nscan690gt_scan_mode(payload: dict[str, Any]) -> dict[str, Any]:
     """Extension Auto/Manual toggle for Ambir nScan 690gt."""
     global _nscan690gt_mode
@@ -186,8 +238,11 @@ def _handle_set_nscan690gt_scan_mode(payload: dict[str, Any]) -> dict[str, Any]:
     if mode not in ("auto", "manual"):
         return _error('mode must be "auto" or "manual"')
 
-    logger.info("[host] SET_NSCAN690GT_SCAN_MODE mode=%r (was %r)", mode, _nscan690gt_mode)
+    logger.info("[host] SET_NSCAN690GT_SCAN_MODE mode=%r (was %r) active_scanner=%r", mode, _nscan690gt_mode, _active_scanner)
     _nscan690gt_mode = mode
+    if _active_scanner != "twain":
+        _stop_nscan690gt_auto_watch()
+        return {"type": "NSCAN690GT_SCAN_MODE", "success": True, "mode": mode, "ignored": "thales_selected"}
     if mode == "auto":
         _start_nscan690gt_auto_watch()
     else:
@@ -274,6 +329,7 @@ _COMMAND_HANDLERS: dict[str, CommandHandler] = {
     "SCAN_DOCUMENT_AMBIR":      _handle_scan_document_ambir,      # AMBIR DocketPORT (explicit)
     "SCAN_DOCUMENT_NSCAN690GT": _handle_scan_document_nscan690gt, # AMBIR nScan 690gt SDK
     "SET_NSCAN690GT_SCAN_MODE": _handle_set_nscan690gt_scan_mode, # Ambir Auto / Manual
+    "SET_ACTIVE_SCANNER":       _handle_set_active_scanner,       # QS2000 vs nScan 690gt
     "SCAN_DOCUMENT_AUTO":       _handle_scan_document_auto,       # auto-detect: Thales → AMBIR
     "DEVICE_STATUS": _handle_device_status,
     "DISPENSE_CASH": _not_implemented("DISPENSE_CASH"),
@@ -653,7 +709,7 @@ def run() -> int:
 
     stdin, stdout = messaging.stdin_stdout_streams()
 
-    global _nscan690gt_stdout
+    global _nscan690gt_stdout, _active_scanner
     _nscan690gt_stdout = stdout
 
     stop_watch = threading.Event()
@@ -672,14 +728,10 @@ def run() -> int:
                 "Thales auto-watch expects %s - copy from Application.ini.example if missing.",
                 _app_ini,
             )
-        t = threading.Thread(
-            target=_thales_auto_watch_thread,
-            args=(stdout, stop_watch),
-            name="thales-auto-watch",
-            daemon=True,
-        )
-        t.start()
-        watch_threads.append(t)
+        _active_scanner = "thales"
+        _start_thales_auto_watch()
+        if _thales_watch_thread is not None:
+            watch_threads.append(_thales_watch_thread)
         logger.info(
             "FDN_THALES_AUTO_WATCH is on - each successful Thales read pushes "
             "AUTO_SCAN_RESULT to the extension (listen on native port onMessage)."
@@ -767,6 +819,7 @@ def run() -> int:
     finally:
         stop_watch.set()
         _stop_nscan690gt_auto_watch()
+        _stop_thales_auto_watch()
 
 
 def _wants_native_messaging() -> bool:
