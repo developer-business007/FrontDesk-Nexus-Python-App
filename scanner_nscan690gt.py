@@ -54,9 +54,9 @@ _JPEG_ATTEMPTS: tuple[tuple[int, int], ...] = (
     (420, 36),
     (320, 32),
 )
-# NS690gt.DLL BMPs are inverted vs printed ID text (Auto and Manual). Decode still
-# uses the original raster (PDF417 reads at 180°). Panel JPEGs are always rotated.
-# Override: FDN_NSCAN690GT_ROTATE_CW=0 to skip.
+# Duplex CIS sensors are 180° apart, so one face is already inverted vs the other.
+# BACK = the PDF417 face (rotated so the barcode reads). FRONT = the other face,
+# rotated the opposite way. Override both faces: FDN_NSCAN690GT_ROTATE_CW=180.
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -359,13 +359,13 @@ def _barcode_image_variants(raw_bytes: bytes) -> list[tuple[Any, int | None]]:
         (gray, 0),
         (inverted, 0),
         (ImageOps.autocontrast(gray), 0),
+        (gray.rotate(180, expand=True), 180),
+        (inverted.rotate(180, expand=True), 180),
+        (ImageEnhance.Contrast(gray).enhance(1.8), 0),
     ]
     if h >= 80:
         variants.append((gray.crop((0, int(h * 0.35), w, h)), None))
         variants.append((inverted.crop((0, int(h * 0.35), w, h)), None))
-    variants.append((gray.rotate(180, expand=True), 180))
-    variants.append((inverted.rotate(180, expand=True), 180))
-    variants.append((ImageEnhance.Contrast(gray).enhance(1.8), 0))
     return variants
 
 
@@ -417,8 +417,11 @@ def _try_pdf417(raw_bytes: bytes) -> tuple[dict[str, Any] | None, str, int]:
             rotate_cw = variant_rot if variant_rot else 0
             if rotate_cw == 0:
                 frac = _barcode_y_frac(result, getattr(img, "size", (0, 0))[1])
+                # Upright US DL barcode sits in the lower half. Top-half = inverted raster.
                 if frac is not None and frac < 0.45:
                     rotate_cw = 180
+                elif frac is None and variant_rot is None:
+                    rotate_cw = 0
             logger.info(
                 "nScan690gt: PDF417/AAMVA decoded — doc=%r name=%r dob=%r rotate_cw=%d",
                 structured.get("document_number"),
@@ -480,13 +483,17 @@ def _ocr_google_vision(raw_bytes: bytes) -> str:
                 pass
 
 
-def _panel_rotate_cw() -> int:
-    """Clockwise degrees for FRONT/BACK JPEGs. Default 180 for this scanner."""
-    raw = os.environ.get("FDN_NSCAN690GT_ROTATE_CW", "180").strip() or "180"
+def _panel_rotate_cw_override() -> int | None:
+    """Optional forced clockwise rotation for both sides. Unset = per-side auto."""
+    if "FDN_NSCAN690GT_ROTATE_CW" not in os.environ:
+        return None
+    raw = os.environ.get("FDN_NSCAN690GT_ROTATE_CW", "").strip()
+    if not raw:
+        return None
     try:
         return int(raw) % 360
     except ValueError:
-        return 180
+        return None
 
 
 def _rotate_raster_cw(raw_bytes: bytes, degrees: int) -> bytes:
@@ -503,6 +510,77 @@ def _rotate_raster_cw(raw_bytes: bytes, degrees: int) -> bytes:
     buf = io.BytesIO()
     img.save(buf, format="BMP")
     return buf.getvalue()
+
+
+def _portrait_upright_score(raw_bytes: bytes, rotate_cw: int) -> float:
+    """
+    Higher when the top band looks like a DL header (text/edges) rather than the
+    bottom band. Used to pick 0° vs 180° for the photo side.
+    """
+    from PIL import Image, ImageFilter, ImageOps, ImageStat
+
+    img = Image.open(io.BytesIO(raw_bytes))
+    try:
+        img = ImageOps.exif_transpose(img)
+    except Exception:  # noqa: BLE001
+        pass
+    img = img.convert("L")
+    if rotate_cw:
+        img = img.rotate(-int(rotate_cw) % 360, expand=True)
+    w, h = img.size
+    if h < 20:
+        return 0.0
+    band = max(4, h // 5)
+    top = img.crop((0, 0, w, band)).filter(ImageFilter.FIND_EDGES)
+    bot = img.crop((0, h - band, w, h)).filter(ImageFilter.FIND_EDGES)
+    return float(ImageStat.Stat(top).mean[0]) - float(ImageStat.Stat(bot).mean[0])
+
+
+def _opposite_180(rotate_cw: int) -> int:
+    return (int(rotate_cw) + 180) % 360
+
+
+def _orient_duplex_faces(
+    side0: bytes,
+    side1: bytes,
+) -> tuple[bytes, bytes, dict[str, Any] | None, str]:
+    """
+    DLL side 0/1 is insert-order, not photo vs barcode.
+
+    BACK = the raster with PDF417/AAMVA, rotated so the barcode is readable.
+    FRONT = the other raster, rotated 180° relative to BACK (the two CIS
+    units face opposite directions).
+    """
+    s0, raw0, rot0 = _try_pdf417(side0) if side0 else (None, "", 0)
+    if s0:
+        photo_rot = _opposite_180(rot0)
+        logger.info(
+            "%s duplex assign: barcode on DLL side0 rot=%d → FRONT rot=%d (opposite CIS)",
+            _LOG_TAG, rot0, photo_rot,
+        )
+        return _rotate_raster_cw(side1, photo_rot), _rotate_raster_cw(side0, rot0), s0, raw0
+
+    s1, raw1, rot1 = _try_pdf417(side1) if side1 else (None, "", 0)
+    if s1:
+        photo_rot = _opposite_180(rot1)
+        logger.info(
+            "%s duplex assign: barcode on DLL side1 rot=%d → FRONT rot=%d (opposite CIS)",
+            _LOG_TAG, rot1, photo_rot,
+        )
+        return _rotate_raster_cw(side0, photo_rot), _rotate_raster_cw(side1, rot1), s1, raw1
+
+    rot_a = 0
+    if side0:
+        s_a0 = _portrait_upright_score(side0, 0)
+        s_a180 = _portrait_upright_score(side0, 180)
+        rot_a = 180 if s_a180 > s_a0 else 0
+        logger.info(
+            "%s duplex assign: no PDF417 — FRONT from DLL side0 rot=%d (score0=%.1f score180=%.1f)",
+            _LOG_TAG, rot_a, s_a0, s_a180,
+        )
+    else:
+        logger.info("%s duplex assign: no PDF417 — keep DLL order", _LOG_TAG)
+    return _rotate_raster_cw(side0, rot_a), _rotate_raster_cw(side1, _opposite_180(rot_a)), None, ""
 
 
 def _to_jpeg_b64(raw_bytes: bytes, *, max_edge: int, quality: int) -> str:
@@ -633,7 +711,12 @@ def _build_result(
     }
 
 
-def _decode_from_images(front_b64: str, back_b64: str) -> tuple[dict[str, Any], str, int]:
+def _decode_from_images(
+    front_b64: str,
+    back_b64: str,
+    *,
+    allow_pdf417: bool = True,
+) -> tuple[dict[str, Any], str, int]:
     """PDF417/AAMVA first (back then front); Google Vision OCR fallback. Never hang the host."""
     from scanner import empty_id_fields, parse_id_fields
 
@@ -641,26 +724,28 @@ def _decode_from_images(front_b64: str, back_b64: str) -> tuple[dict[str, Any], 
     back_bytes = base64.b64decode(back_b64) if back_b64 else b""
 
     _log_step(
-        "decode start — front=%d bytes back=%d bytes",
+        "decode start — front=%d bytes back=%d bytes pdf417=%s",
         len(front_bytes),
         len(back_bytes),
+        allow_pdf417,
     )
 
     structured, aamva_raw, rotate_cw = None, "", 0
-    for label, raw in (("back", back_bytes), ("front", front_bytes)):
-        if not raw:
-            continue
-        _log_step("PDF417/AAMVA decode on %s…", label)
-        structured, aamva_raw, rotate_cw = _try_pdf417(raw)
-        if structured:
-            _log_step(
-                "PDF417 OK on %s — doc=%r name=%r rotate_cw=%d",
-                label,
-                structured.get("document_number"),
-                structured.get("full_name"),
-                rotate_cw,
-            )
-            break
+    if allow_pdf417:
+        for label, raw in (("back", back_bytes), ("front", front_bytes)):
+            if not raw:
+                continue
+            _log_step("PDF417/AAMVA decode on %s…", label)
+            structured, aamva_raw, rotate_cw = _try_pdf417(raw)
+            if structured:
+                _log_step(
+                    "PDF417 OK on %s — doc=%r name=%r rotate_cw=%d",
+                    label,
+                    structured.get("document_number"),
+                    structured.get("full_name"),
+                    rotate_cw,
+                )
+                break
 
     if structured:
         return structured, aamva_raw, rotate_cw
@@ -721,19 +806,26 @@ def _sdk_ok_to_document_result(sdk_ok: dict[str, Any], *, scan_mode: str) -> dic
     front_bytes = base64.b64decode(front_b64) if front_b64 else b""
     back_bytes = base64.b64decode(back_b64) if back_b64 else b""
 
-    structured, aamva_raw, _decode_rotate = _decode_from_images(front_b64, back_b64)
-    # Always apply the 690gt panel rotation — barcode decode succeeds on inverted
-    # originals, so the decode-time heuristic often left rotate_cw=0.
-    rotate_cw = _panel_rotate_cw()
-    if rotate_cw:
-        logger.info(
-            "%s rotating panel images %d° clockwise for upright display (decode guessed %d°)",
-            _LOG_TAG, rotate_cw, _decode_rotate,
-        )
-        if front_bytes:
-            front_bytes = _rotate_raster_cw(front_bytes, rotate_cw)
-        if back_bytes:
-            back_bytes = _rotate_raster_cw(back_bytes, rotate_cw)
+    override = _panel_rotate_cw_override()
+    if override is not None:
+        structured, aamva_raw, _decode_rotate = _decode_from_images(front_b64, back_b64)
+        if override:
+            logger.info(
+                "%s FDN_NSCAN690GT_ROTATE_CW=%d (both faces, decode guessed %d°)",
+                _LOG_TAG, override, _decode_rotate,
+            )
+            if front_bytes:
+                front_bytes = _rotate_raster_cw(front_bytes, override)
+            if back_bytes:
+                back_bytes = _rotate_raster_cw(back_bytes, override)
+    else:
+        front_bytes, back_bytes, structured, aamva_raw = _orient_duplex_faces(front_bytes, back_bytes)
+        if not structured:
+            structured, aamva_raw, _ = _decode_from_images(
+                base64.b64encode(front_bytes).decode("ascii") if front_bytes else "",
+                base64.b64encode(back_bytes).decode("ascii") if back_bytes else "",
+                allow_pdf417=False,
+            )
     result: dict[str, Any] | None = None
     for max_edge, quality in _JPEG_ATTEMPTS:
         jpeg_front, jpeg_back = _compact_side_jpegs(
