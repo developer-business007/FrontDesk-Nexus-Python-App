@@ -72,8 +72,16 @@ def _preview_barcode(raw: str, *, limit: int = 160) -> str:
     return "".join(out) + (f"…(+{extra})" if extra else "")
 
 
+# zxing / some dumpers spell AAMVA separators as these tokens instead of control chars.
+_PLACEHOLDER_SEPS: tuple[str, ...] = (
+    "<CRLF>", "<LF>", "<CR>", "<RS>", "<GS>", "<FS>",
+    "&lt;LF&gt;", "&lt;CR&gt;", "&lt;RS&gt;",
+)
+_NAME_SUFFIXES = frozenset({"JR", "SR", "I", "II", "III", "IV", "V", "2ND", "3RD"})
+
+
 def _normalize_aamva_raw(raw: str) -> str:
-    """UTF-16 leftovers + AAMVA record separators → searchable text."""
+    """UTF-16 leftovers + AAMVA / placeholder separators → newline-separated text."""
     t = raw or ""
     if "\x00" in t:
         # zxing sometimes yields UTF-16LE as Latin-1
@@ -81,21 +89,32 @@ def _normalize_aamva_raw(raw: str) -> str:
             t = t.encode("latin-1", errors="replace").decode("utf-16-le", errors="replace")
         except Exception:  # noqa: BLE001
             t = t.replace("\x00", "")
-    for sep in ("\x1e", "\x1c", "\x1d", "\x0b", "\x0c"):
+    for tok in _PLACEHOLDER_SEPS:
+        t = t.replace(tok, "\n")
+    t = t.replace("\\r\\n", "\n").replace("\\n", "\n").replace("\\r", "\n")
+    for sep in ("\x1e", "\x1c", "\x1d", "\x0b", "\x0c", "\u2028", "\u2029", "\u0085"):
         t = t.replace(sep, "\n")
     t = t.replace("\r\n", "\n").replace("\r", "\n")
-    return t
+    return re.sub(r"\n+", "\n", t)
 
 
 def _clean_aamva_value(raw: str) -> str:
-    """First line only; strip control chars; AAMVA 'NONE' → empty."""
-    s = (raw or "")
-    for sep in ("\r", "\x00", "\x1e", "\x1c", "\x1d", "\x0b", "\x0c"):
-        s = s.replace(sep, "\n")
-    s = s.split("\n", 1)[0].strip(" \t*")
+    """First AAMVA field only; strip separators; AAMVA 'NONE' → empty."""
+    s = _normalize_aamva_raw("" if raw is None else str(raw))
+    s = s.split("\n", 1)[0]
+    s = re.sub(r"<[A-Z]{1,4}>", "", s)
+    s = s.strip(" \t*")
     if s.upper() in _AAMVA_NONE:
         return ""
     return s
+
+
+def _payload_has_extra_tags(val: str) -> bool:
+    """True when a 'value' still contains more Dxx/Zxx records (unsplit barcode)."""
+    u = _normalize_aamva_raw(val).upper()
+    if "\n" in u:
+        return True
+    return bool(re.search(r"(?:^|[^A-Z])(?:D|Z)[A-Z]{2}", u[1:])) if len(u) > 4 else False
 
 
 def _guest_text(value: Any) -> str:
@@ -129,10 +148,23 @@ def _extract_aamva_elements(raw: str) -> dict[str, str]:
             if val or tag in ("DAD",):  # explicit NONE already cleaned to ""
                 fields[tag] = val
 
-    if fields.get("DAC") or fields.get("DCS") or fields.get("DAQ"):
-        return {k: _clean_aamva_value(v) for k, v in fields.items()}
+    cleaned = {k: _clean_aamva_value(v) for k, v in fields.items()}
+    daq = cleaned.get("DAQ") or ""
+    has_name = bool(cleaned.get("DAC") or cleaned.get("DCS") or cleaned.get("DCT"))
+    if has_name and daq and not _payload_has_extra_tags(fields.get("DAQ") or daq):
+        return cleaned
 
-    # Packed single-line fallback (no LFs between tags).
+    # Packed fallback (no LFs, or a fat DAQ that still contains DCS/DAC/…).
+    packed = _extract_packed_aamva(text)
+    merged = dict(packed)
+    for k, v in cleaned.items():
+        if v and not _payload_has_extra_tags(fields.get(k) or v):
+            merged[k] = v
+    return {k: _clean_aamva_value(v) for k, v in merged.items()}
+
+
+def _extract_packed_aamva(text: str) -> dict[str, str]:
+    """Single-line AAMVA: walk known element IDs left-to-right."""
     upper = text.upper()
     hits: list[tuple[int, str]] = []
     for tag in _AAMVA_TAGS:
@@ -143,7 +175,7 @@ def _extract_aamva_elements(raw: str) -> dict[str, str]:
                 break
             prev = upper[pos - 1] if pos > 0 else "\n"
             prefix2 = upper[pos - 2 : pos] if pos >= 2 else ""
-            if (not prev.isalpha()) or prefix2 in ("DL", "ID", "ZV"):
+            if (not prev.isalpha()) or prefix2 in ("DL", "ID", "ZV", "ZN"):
                 hits.append((pos, tag))
             start = pos + 1
     hits.sort(key=lambda x: x[0])
@@ -163,7 +195,7 @@ def _aamva_date(raw: str) -> str:
     if len(digits) >= 8:
         s = digits[:8]
     else:
-        return (raw or "").strip()
+        return ""
     first4 = int(s[:4])
     if first4 > 1231:
         return f"{s[0:4]}-{s[4:6]}-{s[6:8]}"
@@ -192,6 +224,10 @@ def _parse_aamva(raw: str) -> dict[str, Any]:
     last = _guest_text(re.split(r"\s{2,}", last)[0])
     middle = _guest_text(re.split(r"\s{2,}", middle)[0])
 
+    suffix = _guest_text(fields.get("DCU") or "")
+    if suffix.upper() in _NAME_SUFFIXES and suffix.upper() not in first.upper().split():
+        first = f"{first} {suffix}".strip()
+
     full_name = " ".join(x for x in (first, middle, last) if x)
     dob = _aamva_date(_guest_text(fields.get("DBB", "")))
     expiry = _aamva_date(_guest_text(fields.get("DBA", "")))
@@ -209,7 +245,7 @@ def _parse_aamva(raw: str) -> dict[str, Any]:
     address = f"{street}, {city_state_zip}".strip(" ,") if city_state_zip else street
 
     barcode_data: dict[str, Any] = {"source": "pdf417_aamva", "tags": sorted(fields.keys())}
-    for k in ("DAQ", "DCS", "DAC", "DCT", "DAD", "DBB", "DBA", "DBD", "DAG", "DAI", "DAJ", "DAK", "DBC"):
+    for k in ("DAQ", "DCS", "DAC", "DCT", "DAD", "DCU", "DBB", "DBA", "DBD", "DAG", "DAI", "DAJ", "DAK", "DBC"):
         if k in fields:
             barcode_data[k] = _guest_text(fields[k])
 
@@ -241,6 +277,14 @@ def _parse_aamva(raw: str) -> dict[str, Any]:
 # zxingcpp PDF417 reader
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _aamva_identity_ok(structured: dict[str, Any] | None) -> bool:
+    if not structured:
+        return False
+    doc = structured.get("document_number") or ""
+    name_ok = bool(structured.get("first_name") or structured.get("last_name"))
+    return bool(doc) and name_ok and not _payload_has_extra_tags(doc)
+
+
 def _is_aamva_text(text: str) -> bool:
     t = text or ""
     u = t.upper()
@@ -249,11 +293,11 @@ def _is_aamva_text(text: str) -> bool:
     return "DAQ" in u and ("DCS" in u or "DAC" in u or "DCT" in u or "DBB" in u)
 
 
-def _pdf417_candidates_from_pil(img: Any) -> list[str]:
-    """Run zxingcpp on one PIL image; return candidate barcode texts."""
+def _pdf417_candidates_from_pil(img: Any) -> list[tuple[str, Any]]:
+    """Run zxingcpp on one PIL image; return (text, result) pairs."""
     import zxingcpp
 
-    texts: list[str] = []
+    out: list[tuple[str, Any]] = []
     try:
         fmt = getattr(zxingcpp, "BarcodeFormat", None)
         pdf417 = getattr(fmt, "PDF417", None) if fmt is not None else None
@@ -266,38 +310,65 @@ def _pdf417_candidates_from_pil(img: Any) -> list[str]:
             results = zxingcpp.read_barcodes(img)
     except Exception as exc:  # noqa: BLE001
         logger.debug("nScan690gt: zxingcpp.read_barcodes failed: %s", exc)
-        return texts
+        return out
 
     for r in results or []:
         text = (getattr(r, "text", None) or "").strip()
         if text:
-            texts.append(text)
-    return texts
+            out.append((text, r))
+    return out
 
 
-def _barcode_image_variants(raw_bytes: bytes) -> list[Any]:
+def _barcode_y_frac(result: Any, img_h: int) -> float | None:
+    if img_h <= 0:
+        return None
+    pos = getattr(result, "position", None)
+    if pos is None:
+        return None
+    ys: list[float] = []
+    for name in ("top_left", "top_right", "bottom_left", "bottom_right"):
+        pt = getattr(pos, name, None)
+        if pt is None:
+            continue
+        y = getattr(pt, "y", None)
+        if y is None:
+            y = getattr(pt, "Y", None)
+        if y is not None:
+            try:
+                ys.append(float(y))
+            except (TypeError, ValueError):
+                pass
+    if not ys:
+        return None
+    return (sum(ys) / len(ys)) / float(img_h)
+
+
+def _barcode_image_variants(raw_bytes: bytes) -> list[tuple[Any, int | None]]:
+    """(image, rotate_cw_if_this_variant_decodes). None = unknown (cropped)."""
     from PIL import Image, ImageEnhance, ImageOps
 
     base = Image.open(io.BytesIO(raw_bytes))
     gray = ImageOps.exif_transpose(base).convert("L")
-    variants: list[Any] = [gray]
     w, h = gray.size
     inverted = ImageOps.invert(gray)
-    variants.append(inverted)
-    variants.append(ImageOps.autocontrast(gray))
+    variants: list[tuple[Any, int | None]] = [
+        (gray, 0),
+        (inverted, 0),
+        (ImageOps.autocontrast(gray), 0),
+    ]
     if h >= 80:
-        variants.append(gray.crop((0, int(h * 0.35), w, h)))
-        variants.append(inverted.crop((0, int(h * 0.35), w, h)))
-    variants.append(gray.rotate(180, expand=True))
-    variants.append(inverted.rotate(180, expand=True))
-    variants.append(ImageEnhance.Contrast(gray).enhance(1.8))
+        variants.append((gray.crop((0, int(h * 0.35), w, h)), None))
+        variants.append((inverted.crop((0, int(h * 0.35), w, h)), None))
+    variants.append((gray.rotate(180, expand=True), 180))
+    variants.append((inverted.rotate(180, expand=True), 180))
+    variants.append((ImageEnhance.Contrast(gray).enhance(1.8), 0))
     return variants
 
 
-def _try_pdf417(raw_bytes: bytes) -> tuple[dict[str, Any] | None, str]:
+def _try_pdf417(raw_bytes: bytes) -> tuple[dict[str, Any] | None, str, int]:
     """
     Attempt PDF417 barcode decode on the scanned image.
-    Returns (structured_dict, aamva_raw_text) on success, or (None, "") on failure.
+    Returns (structured_dict, aamva_raw_text, rotate_cw) on success, or (None, "", 0).
     """
     try:
         import zxingcpp  # noqa: F401
@@ -308,17 +379,17 @@ def _try_pdf417(raw_bytes: bytes) -> tuple[dict[str, Any] | None, str]:
             "Install on hotel PC:  python -m pip install zxing-cpp Pillow",
             exc,
         )
-        return None, ""
+        return None, "", 0
 
     try:
         variants = _barcode_image_variants(raw_bytes)
     except Exception as exc:  # noqa: BLE001
         logger.warning("nScan690gt: cannot open scan image for PDF417: %s", exc)
-        return None, ""
+        return None, "", 0
 
     seen: set[str] = set()
-    for img in variants:
-        for text in _pdf417_candidates_from_pil(img):
+    for img, variant_rot in variants:
+        for text, result in _pdf417_candidates_from_pil(img):
             if text in seen:
                 continue
             seen.add(text)
@@ -336,22 +407,29 @@ def _try_pdf417(raw_bytes: bytes) -> tuple[dict[str, Any] | None, str]:
             if isinstance(bd, dict):
                 tags = bd.get("tags") or []
             logger.info("nScan690gt: AAMVA tags=%s", tags)
-            if structured.get("document_number") or structured.get("last_name") or structured.get("first_name"):
-                logger.info(
-                    "nScan690gt: PDF417/AAMVA decoded — doc=%r name=%r dob=%r",
-                    structured.get("document_number"),
-                    structured.get("full_name"),
-                    structured.get("date_of_birth"),
-                )
-                return structured, text
-            logger.info("nScan690gt: AAMVA text parsed but empty key fields — continue")
+            if not _aamva_identity_ok(structured):
+                logger.info("nScan690gt: AAMVA text parsed but empty/unsplit key fields — continue")
+                continue
+            rotate_cw = variant_rot if variant_rot else 0
+            if rotate_cw == 0:
+                frac = _barcode_y_frac(result, getattr(img, "size", (0, 0))[1])
+                if frac is not None and frac < 0.45:
+                    rotate_cw = 180
+            logger.info(
+                "nScan690gt: PDF417/AAMVA decoded — doc=%r name=%r dob=%r rotate_cw=%d",
+                structured.get("document_number"),
+                structured.get("full_name"),
+                structured.get("date_of_birth"),
+                rotate_cw,
+            )
+            return structured, text, rotate_cw
 
     logger.info(
         "nScan690gt: no usable AAMVA PDF417 (%d variants, %d unique texts)",
         len(variants),
         len(seen),
     )
-    return None, ""
+    return None, "", 0
 
 
 def _bmp_to_jpeg_file(raw_bytes: bytes, *, max_edge: int = 2200) -> Path:
@@ -396,6 +474,22 @@ def _ocr_google_vision(raw_bytes: bytes) -> str:
                 path.unlink(missing_ok=True)
             except OSError:
                 pass
+
+
+def _rotate_raster_cw(raw_bytes: bytes, degrees: int) -> bytes:
+    if not raw_bytes or not degrees:
+        return raw_bytes
+    from PIL import Image, ImageOps
+
+    img = Image.open(io.BytesIO(raw_bytes))
+    try:
+        img = ImageOps.exif_transpose(img)
+    except Exception:  # noqa: BLE001
+        pass
+    img = img.rotate(-int(degrees) % 360, expand=True)
+    buf = io.BytesIO()
+    img.save(buf, format="BMP")
+    return buf.getvalue()
 
 
 def _to_jpeg_b64(raw_bytes: bytes, *, max_edge: int, quality: int) -> str:
@@ -526,7 +620,7 @@ def _build_result(
     }
 
 
-def _decode_from_images(front_b64: str, back_b64: str) -> tuple[dict[str, Any], str]:
+def _decode_from_images(front_b64: str, back_b64: str) -> tuple[dict[str, Any], str, int]:
     """PDF417/AAMVA first (back then front); Google Vision OCR fallback. Never hang the host."""
     from scanner import empty_id_fields, parse_id_fields
 
@@ -539,18 +633,24 @@ def _decode_from_images(front_b64: str, back_b64: str) -> tuple[dict[str, Any], 
         len(back_bytes),
     )
 
-    structured, aamva_raw = None, ""
+    structured, aamva_raw, rotate_cw = None, "", 0
     for label, raw in (("back", back_bytes), ("front", front_bytes)):
         if not raw:
             continue
         _log_step("PDF417/AAMVA decode on %s…", label)
-        structured, aamva_raw = _try_pdf417(raw)
+        structured, aamva_raw, rotate_cw = _try_pdf417(raw)
         if structured:
-            _log_step("PDF417 OK on %s — doc=%r name=%r", label, structured.get("document_number"), structured.get("full_name"))
+            _log_step(
+                "PDF417 OK on %s — doc=%r name=%r rotate_cw=%d",
+                label,
+                structured.get("document_number"),
+                structured.get("full_name"),
+                rotate_cw,
+            )
             break
 
     if structured:
-        return structured, aamva_raw
+        return structured, aamva_raw, rotate_cw
 
     _log_step("no usable barcode — Google Vision OCR on front then back")
     combined_text = ""
@@ -596,7 +696,7 @@ def _decode_from_images(front_b64: str, back_b64: str) -> tuple[dict[str, Any], 
         "mrz_raw": "",
         "barcode_data": {"source": source},
     }
-    return structured, ""
+    return structured, "", 0
 
 
 def _sdk_ok_to_document_result(sdk_ok: dict[str, Any], *, scan_mode: str) -> dict[str, Any]:
@@ -608,7 +708,13 @@ def _sdk_ok_to_document_result(sdk_ok: dict[str, Any], *, scan_mode: str) -> dic
     front_bytes = base64.b64decode(front_b64) if front_b64 else b""
     back_bytes = base64.b64decode(back_b64) if back_b64 else b""
 
-    structured, aamva_raw = _decode_from_images(front_b64, back_b64)
+    structured, aamva_raw, rotate_cw = _decode_from_images(front_b64, back_b64)
+    if rotate_cw:
+        logger.info("%s rotating panel images %d° clockwise for upright display", _LOG_TAG, rotate_cw)
+        if front_bytes:
+            front_bytes = _rotate_raster_cw(front_bytes, rotate_cw)
+        if back_bytes:
+            back_bytes = _rotate_raster_cw(back_bytes, rotate_cw)
     result: dict[str, Any] | None = None
     for max_edge, quality in _JPEG_ATTEMPTS:
         jpeg_front, jpeg_back = _compact_side_jpegs(
