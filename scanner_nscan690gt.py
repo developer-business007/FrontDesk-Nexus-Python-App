@@ -1,21 +1,22 @@
 """
 AMBIR nScan 690gt scan module.
 
-Pipeline (NS690gt.DLL SI_* API):
-  1. Manual: SI_GetPaperStatus wait → SI_StartScan duplex → front + back BMP
-  2. Auto:   background paper poll → scan on insert (see main.py auto-watch)
-  3. zxingcpp PDF417/AAMVA on back (then front), Windows.Media.Ocr fallback
-  4. Returns SDK_DOCUMENT_RESULT / AUTO_SCAN_RESULT for the extension
+NS690gt.DLL is image capture only (SI_*). There is no OCR/PDF417 in the 690gt SDK.
+AmbirScan's Auto/Manual OCR is a separate app layer — we implement the equivalent here:
+
+  1. Duplex capture via NS690gt.DLL
+  2. Software PDF417 → AAMVA (US DL/ID) via zxing-cpp  — primary, structured fields
+  3. Google Cloud Vision document OCR on front+back     — fallback (same as DocketPORT)
+  4. Return SDK_DOCUMENT_RESULT / AUTO_SCAN_RESULT
 """
 
 from __future__ import annotations
 
-import asyncio
 import base64
 import io
 import logging
 import re
-import sys
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -28,74 +29,143 @@ def _log_step(msg: str, *args: Any) -> None:
     """Always-visible milestone lines in native-host.log (prefix for easy grepping)."""
     logger.info("%s " + msg, _LOG_TAG, *args)
 
-# Matches AAMVA three-letter field codes followed by value text.
-_AAMVA_FIELD_RE = re.compile(r'([A-Z]{3})([^\r\n]*)')
+# AAMVA DL/ID Design Standard element IDs used on US credentials (v1–v10).
+_AAMVA_TAGS: tuple[str, ...] = (
+    "DAA", "DAB", "DAC", "DAD", "DAG", "DAI", "DAJ", "DAK", "DAQ", "DAU", "DAY",
+    "DBA", "DBB", "DBC", "DBD", "DBF",
+    "DCA", "DCB", "DCD", "DCF", "DCG", "DCK", "DCS", "DCT", "DCU",
+    "DDA", "DDB", "DDC", "DDD", "DDE",
+    "ZNA", "ZNB", "ZNC",
+)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # AAMVA PDF417 parser
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _aamva_date(mmddyyyy: str) -> str:
-    """Convert MMDDYYYY → ISO date (YYYY-MM-DD). Returns original string on bad input."""
-    s = (mmddyyyy or "").strip()
-    if len(s) == 8 and s.isdigit():
-        return f"{s[4:]}-{s[:2]}-{s[2:4]}"
-    return s
+def _preview_barcode(raw: str, *, limit: int = 160) -> str:
+    """Log-safe barcode preview (control chars escaped, truncated)."""
+    out = []
+    for ch in (raw or "")[:limit]:
+        o = ord(ch)
+        if ch in "\n\r\t" or 32 <= o < 127:
+            out.append(ch if ch != "\n" else "\\n")
+        else:
+            out.append(f"\\x{o:02x}")
+    extra = max(0, len(raw or "") - limit)
+    return "".join(out) + (f"…(+{extra})" if extra else "")
+
+
+def _normalize_aamva_raw(raw: str) -> str:
+    """UTF-16 leftovers + AAMVA record separators → searchable text."""
+    t = raw or ""
+    if "\x00" in t:
+        # zxing sometimes yields UTF-16LE as Latin-1
+        try:
+            t = t.encode("latin-1", errors="replace").decode("utf-16-le", errors="replace")
+        except Exception:  # noqa: BLE001
+            t = t.replace("\x00", "")
+    for sep in ("\x1e", "\x1c", "\x1d", "\x0b", "\x0c"):
+        t = t.replace(sep, "\n")
+    t = t.replace("\r\n", "\n").replace("\r", "\n")
+    return t
+
+
+def _extract_aamva_elements(raw: str) -> dict[str, str]:
+    """
+    Extract AAMVA element-id → value.
+
+    US PDF417 is usually one packed header line (`ANSI 6360…DLDAQ…DCS…`) plus
+    optional LF-separated fields. Matching any `[A-Z]{3}` swallows the rest of
+    the line (including DAQ/DCS) into `ANS` — that was the empty-fields bug.
+    """
+    text = _normalize_aamva_raw(raw)
+    upper = text.upper()
+    hits: list[tuple[int, str]] = []
+    for tag in _AAMVA_TAGS:
+        start = 0
+        while True:
+            pos = upper.find(tag, start)
+            if pos < 0:
+                break
+            prev = upper[pos - 1] if pos > 0 else "\n"
+            prefix2 = upper[pos - 2 : pos] if pos >= 2 else ""
+            # Packed AAMVA is `DLDAQ…` / `IDDAC…` — letter immediately before the tag is ok
+            # for subfile types. Reject mid-word matches like DATA.
+            if (not prev.isalpha()) or prefix2 in ("DL", "ID", "ZV"):
+                hits.append((pos, tag))
+            start = pos + 1
+    hits.sort(key=lambda x: x[0])
+
+    # Prefer the last (rightmost) occurrence of each tag — header offsets can
+    # coincidentally contain the letters, real values follow.
+    fields: dict[str, str] = {}
+    for i, (pos, tag) in enumerate(hits):
+        end = hits[i + 1][0] if i + 1 < len(hits) else len(text)
+        value = text[pos + 3 : end].strip(" \t\n\r\x00*")
+        if value:
+            fields[tag] = value
+    return fields
+
+
+def _aamva_date(raw: str) -> str:
+    """AAMVA v1–v7 MMDDYYYY or v8+ CCYYMMDD → YYYY-MM-DD."""
+    s = (raw or "").strip()
+    digits = re.sub(r"\D", "", s)
+    if len(digits) >= 8:
+        s = digits[:8]
+    else:
+        return (raw or "").strip()
+    first4 = int(s[:4])
+    if first4 > 1231:
+        return f"{s[0:4]}-{s[4:6]}-{s[6:8]}"
+    return f"{s[4:8]}-{s[0:2]}-{s[2:4]}"
 
 
 def _parse_aamva(raw: str) -> dict[str, Any]:
-    """
-    Parse AAMVA PDF417 raw text into a structured snake_case dict.
+    """Parse AAMVA PDF417 raw text into structured snake_case guest fields."""
+    fields = _extract_aamva_elements(raw)
 
-    Supports US AAMVA DL/ID PDF417 barcode (version 1–9+).
-    Key field codes used:
-      DAQ = DL number   DCS = last name    DAC = first name  DAD = middle name
-      DBB = DOB         DBA = expiry       DBD = issue date
-      DAG = street      DAI = city         DAJ = state       DAK = postal code
-      DBC = sex (1=M / 2=F)
-    """
-    fields: dict[str, str] = {}
-    for m in _AAMVA_FIELD_RE.finditer(raw):
-        code, value = m.group(1), m.group(2).strip()
-        if code not in fields:  # first occurrence wins
-            fields[code] = value
+    first = (fields.get("DAC") or fields.get("DCT") or "").strip()
+    last = (fields.get("DCS") or "").strip()
+    middle = (fields.get("DAD") or "").strip()
 
-    first = fields.get("DAC", "").strip()
-    last = fields.get("DCS", "").strip()
-    middle = fields.get("DAD", "").strip()
-
-    # Fallback: some jurisdictions encode "LAST$FIRST$MIDDLE" in DAA
     if not (first or last):
         daa = fields.get("DAA", "")
-        parts = [p.strip() for p in re.split(r"[$,]", daa) if p.strip()]
+        parts = [p.strip() for p in re.split(r"[,;$]", daa) if p.strip()]
         if len(parts) >= 2:
             last, first = parts[0], parts[1]
             middle = parts[2] if len(parts) >= 3 else ""
         elif len(parts) == 1:
             last = parts[0]
 
+    # Truncate given-name packing: "JOHN ROBERT" may include extra AAMVA junk after space-run
+    first = re.split(r"\s{2,}", first)[0].strip()
+    last = re.split(r"\s{2,}", last)[0].strip()
+    middle = re.split(r"\s{2,}", middle)[0].strip()
+
     full_name = " ".join(x for x in (first, middle, last) if x)
     dob = _aamva_date(fields.get("DBB", ""))
     expiry = _aamva_date(fields.get("DBA", ""))
     issue = _aamva_date(fields.get("DBD", ""))
-    dl_num = fields.get("DAQ", "").strip()
-    street = fields.get("DAG", "").strip()
-    city = fields.get("DAI", "").strip()
-    state_code = fields.get("DAJ", "").strip()
-    postal = fields.get("DAK", "").strip()[:5]
-    sex_code = fields.get("DBC", "").strip()
-    sex = "M" if sex_code == "1" else ("F" if sex_code == "2" else "")
+    dl_num = (fields.get("DAQ") or "").strip()
+    street = (fields.get("DAG") or "").strip()
+    city = (fields.get("DAI") or "").strip()
+    state_code = (fields.get("DAJ") or "").strip()[:2]
+    postal_raw = re.sub(r"\D", "", fields.get("DAK", "") or "")
+    postal = postal_raw[:5] if postal_raw else ""
+    sex_code = (fields.get("DBC") or "").strip().upper()
+    sex = {"1": "M", "2": "F", "M": "M", "F": "F", "9": ""}.get(sex_code, "")
 
-    city_state_zip = " ".join(x for x in (city, state_code, postal) if x)
-    if city_state_zip and state_code:
-        city_state_zip = f"{city}, {state_code} {postal}".strip(", ")
-    address = f"{street}, {city_state_zip}".strip(", ") if city_state_zip else street
+    city_state_zip = f"{city}, {state_code} {postal}".strip(" ,") if (city or state_code) else ""
+    address = f"{street}, {city_state_zip}".strip(" ,") if city_state_zip else street
 
-    barcode_data: dict[str, Any] = {"source": "pdf417_aamva"}
-    for k in ("DAQ", "DCS", "DAC", "DAD", "DBB", "DBA", "DBD", "DAG", "DAI", "DAJ", "DAK", "DBC"):
+    barcode_data: dict[str, Any] = {"source": "pdf417_aamva", "tags": sorted(fields.keys())}
+    for k in ("DAQ", "DCS", "DAC", "DCT", "DAD", "DBB", "DBA", "DBD", "DAG", "DAI", "DAJ", "DAK", "DBC"):
         if k in fields:
             barcode_data[k] = fields[k]
+
+    doc_type = "ID Card" if re.search(r"\bID\b", raw[:80], re.I) and "DL" not in raw[:80].upper() else "Driver License"
 
     return {
         "first_name": first,
@@ -103,7 +173,7 @@ def _parse_aamva(raw: str) -> dict[str, Any]:
         "last_name": last,
         "full_name": full_name,
         "document_number": dl_num,
-        "document_type": "Driver License",
+        "document_type": doc_type,
         "date_of_birth": dob,
         "expiry_date": expiry,
         "issue_date": issue,
@@ -125,12 +195,10 @@ def _parse_aamva(raw: str) -> dict[str, Any]:
 
 def _is_aamva_text(text: str) -> bool:
     t = text or ""
-    return (
-        t.startswith("@")
-        or "ANSI " in t
-        or "AAMVA" in t
-        or ("DAQ" in t and ("DCS" in t or "DAC" in t or "DBB" in t))
-    )
+    u = t.upper()
+    if t.startswith("@") or "ANSI" in u or "AAMVA" in u:
+        return True
+    return "DAQ" in u and ("DCS" in u or "DAC" in u or "DCT" in u or "DBB" in u)
 
 
 def _pdf417_candidates_from_pil(img: Any) -> list[str]:
@@ -159,6 +227,25 @@ def _pdf417_candidates_from_pil(img: Any) -> list[str]:
     return texts
 
 
+def _barcode_image_variants(raw_bytes: bytes) -> list[Any]:
+    from PIL import Image, ImageEnhance, ImageOps
+
+    base = Image.open(io.BytesIO(raw_bytes))
+    gray = ImageOps.exif_transpose(base).convert("L")
+    variants: list[Any] = [gray]
+    w, h = gray.size
+    inverted = ImageOps.invert(gray)
+    variants.append(inverted)
+    variants.append(ImageOps.autocontrast(gray))
+    if h >= 80:
+        variants.append(gray.crop((0, int(h * 0.35), w, h)))
+        variants.append(inverted.crop((0, int(h * 0.35), w, h)))
+    variants.append(gray.rotate(180, expand=True))
+    variants.append(inverted.rotate(180, expand=True))
+    variants.append(ImageEnhance.Contrast(gray).enhance(1.8))
+    return variants
+
+
 def _try_pdf417(raw_bytes: bytes) -> tuple[dict[str, Any] | None, str]:
     """
     Attempt PDF417 barcode decode on the scanned image.
@@ -166,7 +253,7 @@ def _try_pdf417(raw_bytes: bytes) -> tuple[dict[str, Any] | None, str]:
     """
     try:
         import zxingcpp  # noqa: F401
-        from PIL import Image, ImageOps
+        from PIL import Image  # noqa: F401
     except ImportError as exc:
         logger.warning(
             "nScan690gt: zxingcpp or Pillow not installed — skipping PDF417: %s. "
@@ -176,24 +263,10 @@ def _try_pdf417(raw_bytes: bytes) -> tuple[dict[str, Any] | None, str]:
         return None, ""
 
     try:
-        base = Image.open(io.BytesIO(raw_bytes))
+        variants = _barcode_image_variants(raw_bytes)
     except Exception as exc:  # noqa: BLE001
         logger.warning("nScan690gt: cannot open scan image for PDF417: %s", exc)
         return None, ""
-
-    # Try original, grayscale, and a couple of scales / rotations — barcode may be
-    # on either side, rotated, or oversized at 300 DPI.
-    variants: list[Any] = []
-    gray = ImageOps.exif_transpose(base).convert("L")
-    variants.append(gray)
-    w, h = gray.size
-    for scale in (0.75, 0.5):
-        if max(w, h) * scale >= 400:
-            variants.append(
-                gray.resize((max(1, int(w * scale)), max(1, int(h * scale))), Image.Resampling.LANCZOS)
-            )
-    for angle in (180, 90, 270):
-        variants.append(gray.rotate(angle, expand=True))
 
     seen: set[str] = set()
     for img in variants:
@@ -201,10 +274,20 @@ def _try_pdf417(raw_bytes: bytes) -> tuple[dict[str, Any] | None, str]:
             if text in seen:
                 continue
             seen.add(text)
+            logger.info(
+                "nScan690gt: barcode text (%d chars) preview=%s",
+                len(text),
+                _preview_barcode(text),
+            )
             if not _is_aamva_text(text):
-                logger.info("nScan690gt: barcode found but not AAMVA (%d chars) — skip", len(text))
+                logger.info("nScan690gt: barcode found but not AAMVA — skip")
                 continue
             structured = _parse_aamva(text)
+            tags = []
+            bd = structured.get("barcode_data")
+            if isinstance(bd, dict):
+                tags = bd.get("tags") or []
+            logger.info("nScan690gt: AAMVA tags=%s", tags)
             if structured.get("document_number") or structured.get("last_name") or structured.get("first_name"):
                 logger.info(
                     "nScan690gt: PDF417/AAMVA decoded — doc=%r name=%r dob=%r",
@@ -215,125 +298,57 @@ def _try_pdf417(raw_bytes: bytes) -> tuple[dict[str, Any] | None, str]:
                 return structured, text
             logger.info("nScan690gt: AAMVA text parsed but empty key fields — continue")
 
-    logger.info("nScan690gt: no AAMVA PDF417 barcode found in image (%d variants tried)", len(variants))
+    logger.info(
+        "nScan690gt: no usable AAMVA PDF417 (%d variants, %d unique texts)",
+        len(variants),
+        len(seen),
+    )
     return None, ""
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Windows.Media.Ocr fallback
-# ─────────────────────────────────────────────────────────────────────────────
-
-_OCR_MAX_EDGE = 1600  # downscale before WinOCR — full 300 DPI BMPs hang / time out
-_OCR_TIMEOUT_S = 25.0
-
-
-def _prepare_ocr_jpeg_bytes(raw_bytes: bytes) -> bytes:
-    """Downscale + JPEG-encode for faster Windows.Media.Ocr."""
-    from PIL import Image
+def _bmp_to_jpeg_file(raw_bytes: bytes, *, max_edge: int = 2200) -> Path:
+    from PIL import Image, ImageOps
 
     img = Image.open(io.BytesIO(raw_bytes))
     try:
-        from PIL import ImageOps
         img = ImageOps.exif_transpose(img)
     except Exception:  # noqa: BLE001
         pass
     img = img.convert("RGB")
     w, h = img.size
     longest = max(w, h)
-    if longest > _OCR_MAX_EDGE:
-        scale = _OCR_MAX_EDGE / float(longest)
+    if longest > max_edge:
+        scale = max_edge / float(longest)
         img = img.resize((max(1, int(w * scale)), max(1, int(h * scale))), Image.Resampling.LANCZOS)
-    buf = io.BytesIO()
-    img.save(buf, format="JPEG", quality=85)
-    return buf.getvalue()
+    tmp = tempfile.NamedTemporaryFile(suffix=".jpg", delete=False)
+    tmp.close()
+    path = Path(tmp.name)
+    img.save(path, format="JPEG", quality=90)
+    return path
 
 
-async def _ocr_async(image_bytes: bytes) -> str:
-    """Run Windows.Media.Ocr on image bytes. Async because WinRT APIs are async."""
-    from winrt.windows.graphics.imaging import BitmapDecoder
-    from winrt.windows.media.ocr import OcrEngine
-    from winrt.windows.storage.streams import DataWriter, InMemoryRandomAccessStream
+def _ocr_google_vision(raw_bytes: bytes) -> str:
+    """Google Cloud Vision document OCR — 690gt SDK has none; same engine as DocketPORT."""
+    from scanner import ScannerError, extract_text_with_google_vision
 
-    engine = OcrEngine.try_create_from_user_profile_languages()
-    if engine is None:
-        raise RuntimeError("Windows OCR engine unavailable for this user's language profile")
-
-    stream = InMemoryRandomAccessStream()
+    path: Path | None = None
     try:
-        writer = DataWriter(stream)
-        writer.write_bytes(bytearray(image_bytes))
-        await writer.store_async()
-        await writer.flush_async()
-        stream.seek(0)
-
-        decoder = await BitmapDecoder.create_async(stream)
-        bmp = await decoder.get_software_bitmap_async()
-        result = await engine.recognize_async(bmp)
-        return (result.text or "") if result else ""
+        path = _bmp_to_jpeg_file(raw_bytes)
+        text = extract_text_with_google_vision(path)
+        return (text or "").strip()
+    except ScannerError as exc:
+        logger.warning("nScan690gt: Google Vision OCR unavailable/failed: %s", exc)
+        return ""
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("nScan690gt: Google Vision OCR error: %s", exc)
+        return ""
     finally:
-        try:
-            stream.close()
-        except Exception:  # noqa: BLE001
-            pass
-
-
-def _try_windows_ocr(raw_bytes: bytes) -> str:
-    """
-    Run Windows.Media.Ocr synchronously on a downscaled JPEG.
-    Returns extracted text or "" on any error / timeout.
-    """
-    try:
-        ocr_bytes = _prepare_ocr_jpeg_bytes(raw_bytes)
-    except ImportError as exc:
-        logger.warning("nScan690gt: Pillow required for OCR preprocess: %s", exc)
-        ocr_bytes = raw_bytes
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("nScan690gt: OCR preprocess failed (%s) — using raw bytes", exc)
-        ocr_bytes = raw_bytes
-
-    logger.info(
-        "nScan690gt: Windows OCR start — input=%d bytes ocr_payload=%d bytes timeout=%.0fs",
-        len(raw_bytes),
-        len(ocr_bytes),
-        _OCR_TIMEOUT_S,
-    )
-
-    async def _run() -> str:
-        return await asyncio.wait_for(_ocr_async(ocr_bytes), timeout=_OCR_TIMEOUT_S)
-
-    try:
-        text = asyncio.run(_run())
-    except TimeoutError:
-        logger.warning("nScan690gt: Windows OCR timed out after %.0fs", _OCR_TIMEOUT_S)
-        return ""
-    except RuntimeError as exc:
-        msg = str(exc)
-        if "running event loop" in msg.lower() or "This event loop is already running" in msg:
+        if path is not None:
             try:
-                loop = asyncio.new_event_loop()
-                try:
-                    text = loop.run_until_complete(_run())
-                finally:
-                    loop.close()
-            except TimeoutError:
-                logger.warning("nScan690gt: Windows OCR timed out after %.0fs", _OCR_TIMEOUT_S)
-                return ""
-            except Exception as exc2:  # noqa: BLE001
-                logger.warning("nScan690gt: Windows OCR (new loop) failed: %s", exc2)
-                return ""
-        else:
-            logger.warning("nScan690gt: Windows OCR runtime error: %s", exc)
-            return ""
-    except ImportError as exc:
-        logger.warning("nScan690gt: winrt packages not installed — OCR unavailable: %s", exc)
-        return ""
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("nScan690gt: Windows OCR failed: %s", exc)
-        return ""
+                path.unlink(missing_ok=True)
+            except OSError:
+                pass
 
-    text = (text or "").strip()
-    logger.info("nScan690gt: Windows OCR done — %d chars", len(text))
-    return text
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Result builder
@@ -404,7 +419,7 @@ def _build_result(
 
 
 def _decode_from_images(front_b64: str, back_b64: str) -> tuple[dict[str, Any], str]:
-    """PDF417 on back then front; Windows OCR fallback on available sides."""
+    """PDF417/AAMVA first (back then front); Google Vision OCR fallback. Never hang the host."""
     from scanner import empty_id_fields, parse_id_fields
 
     front_bytes = base64.b64decode(front_b64) if front_b64 else b""
@@ -423,20 +438,20 @@ def _decode_from_images(front_b64: str, back_b64: str) -> tuple[dict[str, Any], 
         _log_step("PDF417/AAMVA decode on %s…", label)
         structured, aamva_raw = _try_pdf417(raw)
         if structured:
-            _log_step("PDF417 OK on %s — doc=%r", label, structured.get("document_number"))
+            _log_step("PDF417 OK on %s — doc=%r name=%r", label, structured.get("document_number"), structured.get("full_name"))
             break
 
     if structured:
         return structured, aamva_raw
 
-    _log_step("no barcode — Windows.Media.Ocr fallback")
+    _log_step("no usable barcode — Google Vision OCR on front then back")
     combined_text = ""
-    for label, raw in (("back", back_bytes), ("front", front_bytes)):
+    for label, raw in (("front", front_bytes), ("back", back_bytes)):
         if not raw:
             continue
-        text = _try_windows_ocr(raw)
+        text = _ocr_google_vision(raw)
         if text:
-            _log_step("OCR %s — %d chars", label, len(text))
+            _log_step("Vision OCR %s — %d chars", label, len(text))
             combined_text = (combined_text + "\n" + text).strip() if combined_text else text
 
     if combined_text:
@@ -447,9 +462,11 @@ def _decode_from_images(front_b64: str, back_b64: str) -> tuple[dict[str, Any], 
             ocr_data.get("lastName"),
             ocr_data.get("idNumber"),
         )
+        source = "google_vision"
     else:
-        logger.warning("%s OCR returned no text — empty fields + images only", _LOG_TAG)
+        logger.warning("%s OCR returned no text — returning images so the panel still updates", _LOG_TAG)
         ocr_data = empty_id_fields()
+        source = "none"
 
     structured = {
         "first_name": ocr_data.get("firstName", ""),
@@ -469,7 +486,7 @@ def _decode_from_images(front_b64: str, back_b64: str) -> tuple[dict[str, Any], 
         "gender": ocr_data.get("sex", ""),
         "nationality": "",
         "mrz_raw": "",
-        "barcode_data": {"source": "windows_ocr"},
+        "barcode_data": {"source": source},
     }
     return structured, ""
 

@@ -193,9 +193,8 @@ def _configure_id_scan(dll: ctypes.CDLL, *, target_dpi: int = 300) -> tuple[int,
 
     _set_prop_single_int(dll, SIP_XOFFSET, 0)
     _set_prop_single_int(dll, SIP_YOFFSET, 0)
-    # Duplex / prefeed / EOP are SI_BOOL — SI_INT32 returns 0x901 on nScan 690gt.
+    # Duplex / EOP are SI_BOOL. Prefeed (id=50) is often invalid on 690gt — skip it.
     duplex_set = _set_prop_bool(dll, SIP_DUPLEX_ENABLED, True)
-    _set_prop_bool(dll, SIP_PREFEED_ENABLED, True)
     _set_prop_bool(dll, SIP_EOP_DETECT_ENABLED, True)
 
     w_prop = _get_prop(dll, SIP_SCAN_WIDTH_IN_PIXELS)
