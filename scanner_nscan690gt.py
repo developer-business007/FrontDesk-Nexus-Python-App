@@ -16,6 +16,7 @@ import base64
 import io
 import json
 import logging
+import os
 import re
 import tempfile
 from pathlib import Path
@@ -53,6 +54,9 @@ _JPEG_ATTEMPTS: tuple[tuple[int, int], ...] = (
     (420, 36),
     (320, 32),
 )
+# NS690gt.DLL BMPs are inverted vs printed ID text (Auto and Manual). Decode still
+# uses the original raster (PDF417 reads at 180°). Panel JPEGs are always rotated.
+# Override: FDN_NSCAN690GT_ROTATE_CW=0 to skip.
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -476,6 +480,15 @@ def _ocr_google_vision(raw_bytes: bytes) -> str:
                 pass
 
 
+def _panel_rotate_cw() -> int:
+    """Clockwise degrees for FRONT/BACK JPEGs. Default 180 for this scanner."""
+    raw = os.environ.get("FDN_NSCAN690GT_ROTATE_CW", "180").strip() or "180"
+    try:
+        return int(raw) % 360
+    except ValueError:
+        return 180
+
+
 def _rotate_raster_cw(raw_bytes: bytes, degrees: int) -> bytes:
     if not raw_bytes or not degrees:
         return raw_bytes
@@ -708,9 +721,15 @@ def _sdk_ok_to_document_result(sdk_ok: dict[str, Any], *, scan_mode: str) -> dic
     front_bytes = base64.b64decode(front_b64) if front_b64 else b""
     back_bytes = base64.b64decode(back_b64) if back_b64 else b""
 
-    structured, aamva_raw, rotate_cw = _decode_from_images(front_b64, back_b64)
+    structured, aamva_raw, _decode_rotate = _decode_from_images(front_b64, back_b64)
+    # Always apply the 690gt panel rotation — barcode decode succeeds on inverted
+    # originals, so the decode-time heuristic often left rotate_cw=0.
+    rotate_cw = _panel_rotate_cw()
     if rotate_cw:
-        logger.info("%s rotating panel images %d° clockwise for upright display", _LOG_TAG, rotate_cw)
+        logger.info(
+            "%s rotating panel images %d° clockwise for upright display (decode guessed %d°)",
+            _LOG_TAG, rotate_cw, _decode_rotate,
+        )
         if front_bytes:
             front_bytes = _rotate_raster_cw(front_bytes, rotate_cw)
         if back_bytes:
