@@ -515,7 +515,10 @@ def _thales_auto_watch_thread(stdout: BinaryIO, stop: threading.Event) -> None:
                 "yes" if front_b64 else "no",
                 "yes" if back_b64 else "no",
             )
-            _write_message_safe(stdout, complete)
+            try:
+                _write_message_safe(stdout, complete)
+            except (BrokenPipeError, OSError, ValueError) as exc:
+                logger.error("[auto-watch] failed to push AUTO_SCAN_RESULT: %s", exc)
             _reset_session()
             logger.info("[auto-watch] cooldown %.0f s (remove card now)", cooldown_s)
             time.sleep(cooldown_s)
@@ -566,12 +569,21 @@ def _nscan690gt_auto_watch_thread(stdout: BinaryIO, stop: threading.Event) -> No
 
             backoff = 1.0
             doc_num = (payload.get("document_data") or {}).get("document_number", "")
+            n_out = len(json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8"))
             logger.info(
-                "[auto-watch] nScan690gt: pushing AUTO_SCAN_RESULT document_number=%r two_sided=%s",
+                "[auto-watch] nScan690gt: pushing AUTO_SCAN_RESULT document_number=%r name=%r "
+                "two_sided=%s payload_bytes=%d",
                 doc_num,
+                payload.get("full_name") or payload.get("fullName"),
                 payload.get("two_sided"),
+                n_out,
             )
-            _write_message_safe(stdout, payload)
+            try:
+                _write_message_safe(stdout, payload)
+            except (BrokenPipeError, OSError, ValueError) as exc:
+                logger.error("[auto-watch] nScan690gt: failed to push AUTO_SCAN_RESULT: %s", exc)
+                time.sleep(2.0)
+                continue
             logger.info("[auto-watch] nScan690gt: cooldown %.0f s (remove card)", cooldown_s)
             time.sleep(cooldown_s)
         except Exception:  # noqa: BLE001
@@ -734,6 +746,21 @@ def run() -> int:
 
             try:
                 _write_message_safe(stdout, response)
+            except ValueError as exc:
+                logger.error("Failed to write response (oversize?): %s", exc)
+                try:
+                    slim: dict[str, Any] = {
+                        "type": "ERROR",
+                        "success": False,
+                        "message": str(exc),
+                    }
+                    rid = response.get("requestId")
+                    if isinstance(rid, str) and rid:
+                        slim["requestId"] = rid
+                    _write_message_safe(stdout, slim)
+                except (OSError, ValueError) as exc2:
+                    logger.error("Failed to write slim error response: %s", exc2)
+                    return 1
             except OSError as exc:
                 logger.error("Failed to write response: %s", exc)
                 return 1

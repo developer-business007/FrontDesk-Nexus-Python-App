@@ -48,6 +48,11 @@ def read_message(stream: BinaryIO) -> Optional[dict[str, Any]]:
 def write_message(stream: BinaryIO, message: dict[str, Any]) -> None:
     """Write one JSON object with Chrome Native Messaging framing."""
     body = json.dumps(message, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    # Chrome disconnects the host if a host→extension message is 1 MiB or larger.
+    if len(body) >= 1024 * 1024:
+        raise ValueError(
+            f"Native message {len(body)} bytes exceeds Chrome 1 MiB host→extension limit"
+        )
     header = struct.pack("<I", len(body))
     stream.write(header)
     stream.write(body)

@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import base64
 import io
+import json
 import logging
 import re
 import tempfile
@@ -30,12 +31,27 @@ def _log_step(msg: str, *args: Any) -> None:
     logger.info("%s " + msg, _LOG_TAG, *args)
 
 # AAMVA DL/ID Design Standard element IDs used on US credentials (v1–v10).
+# Include DDE/DDF/DDG so LF-separated values are not swallowed into the previous field.
 _AAMVA_TAGS: tuple[str, ...] = (
     "DAA", "DAB", "DAC", "DAD", "DAG", "DAI", "DAJ", "DAK", "DAQ", "DAU", "DAY",
     "DBA", "DBB", "DBC", "DBD", "DBF",
     "DCA", "DCB", "DCD", "DCF", "DCG", "DCK", "DCS", "DCT", "DCU",
-    "DDA", "DDB", "DDC", "DDD", "DDE",
+    "DDA", "DDB", "DDC", "DDD", "DDE", "DDF", "DDG", "DDH", "DDI", "DDJ", "DDK", "DDL",
     "ZNA", "ZNB", "ZNC",
+)
+_AAMVA_NONE = frozenset({"NONE", "UNAVAILABLE", "N/A", "NA", "NULL"})
+# Chrome native-messaging host→extension max is 1 MiB. Stay under it or Chrome kills the pipe.
+_CHROME_NATIVE_MAX_BYTES = 1024 * 1024
+# Leave room for requestId / framing after we attach metadata in dispatch().
+_CHROME_PAYLOAD_BUDGET = _CHROME_NATIVE_MAX_BYTES - 4096
+_JPEG_ATTEMPTS: tuple[tuple[int, int], ...] = (
+    (1280, 72),
+    (1100, 62),
+    (900, 55),
+    (720, 48),
+    (560, 42),
+    (420, 36),
+    (320, 32),
 )
 
 
@@ -71,15 +87,52 @@ def _normalize_aamva_raw(raw: str) -> str:
     return t
 
 
+def _clean_aamva_value(raw: str) -> str:
+    """First line only; strip control chars; AAMVA 'NONE' → empty."""
+    s = (raw or "")
+    for sep in ("\r", "\x00", "\x1e", "\x1c", "\x1d", "\x0b", "\x0c"):
+        s = s.replace(sep, "\n")
+    s = s.split("\n", 1)[0].strip(" \t*")
+    if s.upper() in _AAMVA_NONE:
+        return ""
+    return s
+
+
+def _guest_text(value: Any) -> str:
+    """Guest-facing string: never leak barcode line-feeds into the extension UI."""
+    return _clean_aamva_value("" if value is None else str(value))
+
+
 def _extract_aamva_elements(raw: str) -> dict[str, str]:
     """
     Extract AAMVA element-id → value.
 
-    US PDF417 is usually one packed header line (`ANSI 6360…DLDAQ…DCS…`) plus
-    optional LF-separated fields. Matching any `[A-Z]{3}` swallows the rest of
-    the line (including DAQ/DCS) into `ANS` — that was the empty-fields bug.
+    Real 690gt barcodes are LF-separated after the ANSI header, e.g.
+    ``…ZT03330056DLDCAC\\nDCBNONE\\nDCSMARTINEZ\\nDACRUBEN``.
     """
     text = _normalize_aamva_raw(raw)
+    fields: dict[str, str] = {}
+
+    # Data subfile starts at the last "DL" / "ID" that is immediately followed by a Dxx tag.
+    data = text
+    starts = [m.start() for m in re.finditer(r"(?:DL|ID)(D[A-Z]{2})", text)]
+    if starts:
+        data = text[starts[-1] :]
+        if data.startswith(("DL", "ID")):
+            data = data[2:]
+
+    for line in data.split("\n"):
+        line = line.strip()
+        if len(line) >= 3 and line[0] in "DZ" and line[1:3].isalpha() and line[1:3].isupper():
+            tag = line[:3]
+            val = _clean_aamva_value(line[3:])
+            if val or tag in ("DAD",):  # explicit NONE already cleaned to ""
+                fields[tag] = val
+
+    if fields.get("DAC") or fields.get("DCS") or fields.get("DAQ"):
+        return {k: _clean_aamva_value(v) for k, v in fields.items()}
+
+    # Packed single-line fallback (no LFs between tags).
     upper = text.upper()
     hits: list[tuple[int, str]] = []
     for tag in _AAMVA_TAGS:
@@ -90,22 +143,17 @@ def _extract_aamva_elements(raw: str) -> dict[str, str]:
                 break
             prev = upper[pos - 1] if pos > 0 else "\n"
             prefix2 = upper[pos - 2 : pos] if pos >= 2 else ""
-            # Packed AAMVA is `DLDAQ…` / `IDDAC…` — letter immediately before the tag is ok
-            # for subfile types. Reject mid-word matches like DATA.
             if (not prev.isalpha()) or prefix2 in ("DL", "ID", "ZV"):
                 hits.append((pos, tag))
             start = pos + 1
     hits.sort(key=lambda x: x[0])
-
-    # Prefer the last (rightmost) occurrence of each tag — header offsets can
-    # coincidentally contain the letters, real values follow.
-    fields: dict[str, str] = {}
+    packed: dict[str, str] = {}
     for i, (pos, tag) in enumerate(hits):
         end = hits[i + 1][0] if i + 1 < len(hits) else len(text)
-        value = text[pos + 3 : end].strip(" \t\n\r\x00*")
+        value = _clean_aamva_value(text[pos + 3 : end])
         if value:
-            fields[tag] = value
-    return fields
+            packed[tag] = value
+    return packed
 
 
 def _aamva_date(raw: str) -> str:
@@ -126,12 +174,12 @@ def _parse_aamva(raw: str) -> dict[str, Any]:
     """Parse AAMVA PDF417 raw text into structured snake_case guest fields."""
     fields = _extract_aamva_elements(raw)
 
-    first = (fields.get("DAC") or fields.get("DCT") or "").strip()
-    last = (fields.get("DCS") or "").strip()
-    middle = (fields.get("DAD") or "").strip()
+    first = _guest_text(fields.get("DAC") or fields.get("DCT") or "")
+    last = _guest_text(fields.get("DCS") or "")
+    middle = _guest_text(fields.get("DAD") or "")
 
     if not (first or last):
-        daa = fields.get("DAA", "")
+        daa = _guest_text(fields.get("DAA", ""))
         parts = [p.strip() for p in re.split(r"[,;$]", daa) if p.strip()]
         if len(parts) >= 2:
             last, first = parts[0], parts[1]
@@ -140,21 +188,21 @@ def _parse_aamva(raw: str) -> dict[str, Any]:
             last = parts[0]
 
     # Truncate given-name packing: "JOHN ROBERT" may include extra AAMVA junk after space-run
-    first = re.split(r"\s{2,}", first)[0].strip()
-    last = re.split(r"\s{2,}", last)[0].strip()
-    middle = re.split(r"\s{2,}", middle)[0].strip()
+    first = _guest_text(re.split(r"\s{2,}", first)[0])
+    last = _guest_text(re.split(r"\s{2,}", last)[0])
+    middle = _guest_text(re.split(r"\s{2,}", middle)[0])
 
     full_name = " ".join(x for x in (first, middle, last) if x)
-    dob = _aamva_date(fields.get("DBB", ""))
-    expiry = _aamva_date(fields.get("DBA", ""))
-    issue = _aamva_date(fields.get("DBD", ""))
-    dl_num = (fields.get("DAQ") or "").strip()
-    street = (fields.get("DAG") or "").strip()
-    city = (fields.get("DAI") or "").strip()
-    state_code = (fields.get("DAJ") or "").strip()[:2]
-    postal_raw = re.sub(r"\D", "", fields.get("DAK", "") or "")
+    dob = _aamva_date(_guest_text(fields.get("DBB", "")))
+    expiry = _aamva_date(_guest_text(fields.get("DBA", "")))
+    issue = _aamva_date(_guest_text(fields.get("DBD", "")))
+    dl_num = _guest_text(fields.get("DAQ") or "")
+    street = _guest_text(fields.get("DAG") or "")
+    city = _guest_text(fields.get("DAI") or "")
+    state_code = _guest_text(fields.get("DAJ") or "")[:2]
+    postal_raw = re.sub(r"\D", "", _guest_text(fields.get("DAK", "")))
     postal = postal_raw[:5] if postal_raw else ""
-    sex_code = (fields.get("DBC") or "").strip().upper()
+    sex_code = _guest_text(fields.get("DBC") or "").upper()
     sex = {"1": "M", "2": "F", "M": "M", "F": "F", "9": ""}.get(sex_code, "")
 
     city_state_zip = f"{city}, {state_code} {postal}".strip(" ,") if (city or state_code) else ""
@@ -163,7 +211,7 @@ def _parse_aamva(raw: str) -> dict[str, Any]:
     barcode_data: dict[str, Any] = {"source": "pdf417_aamva", "tags": sorted(fields.keys())}
     for k in ("DAQ", "DCS", "DAC", "DCT", "DAD", "DBB", "DBA", "DBD", "DAG", "DAI", "DAJ", "DAK", "DBC"):
         if k in fields:
-            barcode_data[k] = fields[k]
+            barcode_data[k] = _guest_text(fields[k])
 
     doc_type = "ID Card" if re.search(r"\bID\b", raw[:80], re.I) and "DL" not in raw[:80].upper() else "Driver License"
 
@@ -350,6 +398,59 @@ def _ocr_google_vision(raw_bytes: bytes) -> str:
                 pass
 
 
+def _to_jpeg_b64(raw_bytes: bytes, *, max_edge: int, quality: int) -> str:
+    """Compress a BMP/JPEG raster for Chrome Native Messaging (1 MB cap)."""
+    from PIL import Image, ImageOps
+
+    img = Image.open(io.BytesIO(raw_bytes))
+    try:
+        img = ImageOps.exif_transpose(img)
+    except Exception:  # noqa: BLE001
+        pass
+    img = img.convert("RGB")
+    w, h = img.size
+    longest = max(w, h)
+    if longest > max_edge:
+        scale = max_edge / float(longest)
+        img = img.resize((max(1, int(w * scale)), max(1, int(h * scale))), Image.Resampling.LANCZOS)
+    buf = io.BytesIO()
+    try:
+        img.save(buf, format="JPEG", quality=quality, optimize=True)
+    except Exception:  # noqa: BLE001
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG", quality=quality)
+    return base64.b64encode(buf.getvalue()).decode("ascii")
+
+
+def _wire_size(result: dict[str, Any]) -> int:
+    return len(json.dumps(result, separators=(",", ":"), ensure_ascii=False).encode("utf-8"))
+
+
+def _compact_side_jpegs(
+    front_bytes: bytes,
+    back_bytes: bytes,
+    *,
+    max_edge: int,
+    quality: int,
+) -> tuple[str, str]:
+    """JPEG-encode one front/back pair at a given size. Decode still uses original BMP."""
+    front_b64 = ""
+    back_b64 = ""
+    try:
+        if front_bytes:
+            front_b64 = _to_jpeg_b64(front_bytes, max_edge=max_edge, quality=quality)
+        if back_bytes:
+            back_b64 = _to_jpeg_b64(back_bytes, max_edge=max_edge, quality=quality)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("%s JPEG compress failed edge=%d q=%d: %s", _LOG_TAG, max_edge, quality, exc)
+        return "", ""
+    logger.info(
+        "%s JPEG panel images edge=%d q=%d front_b64=%d back_b64=%d total=%d",
+        _LOG_TAG, max_edge, quality, len(front_b64), len(back_b64), len(front_b64) + len(back_b64),
+    )
+    return front_b64, back_b64
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Result builder
 # ─────────────────────────────────────────────────────────────────────────────
@@ -365,9 +466,19 @@ def _build_result(
     """Build SDK_DOCUMENT_RESULT with separate front/back image slots."""
     from scanner import sync_structured_document_fields_for_extension
 
+    for key in (
+        "first_name", "middle_name", "last_name", "full_name", "document_number",
+        "document_type", "date_of_birth", "expiry_date", "issue_date", "address",
+        "street_address", "city", "state", "postal_code", "gender",
+    ):
+        if key in structured:
+            structured[key] = _guest_text(structured.get(key, ""))
+
     sync_structured_document_fields_for_extension(structured)
     front = (front_b64 or "").strip()
     back = (back_b64 or "").strip()
+    # One copy per side only — duplicate aliases would 2–3× the payload past Chrome's 1 MB cap.
+    aamva = (aamva_raw or "")[:2000]
 
     return {
         "type": "SDK_DOCUMENT_RESULT",
@@ -377,7 +488,7 @@ def _build_result(
         "two_sided": bool(front and back),
         "vision_ocr_fallback": not bool(aamva_raw),
         "document_data": structured,
-        "aamva_raw": aamva_raw,
+        "aamva_raw": aamva,
         "codeline_raw": "",
         "codeline_data_raw": "",
         "first_name": structured.get("first_name", ""),
@@ -410,11 +521,8 @@ def _build_result(
         "streetAddress": structured.get("streetAddress", ""),
         "postalCode": structured.get("postalCode", ""),
         "sex": structured.get("sex", ""),
-        "image_base64": front or back,
         "image_front_base64": front,
         "image_back_base64": back,
-        "front_image_base64": front,
-        "back_image_base64": back,
     }
 
 
@@ -469,21 +577,21 @@ def _decode_from_images(front_b64: str, back_b64: str) -> tuple[dict[str, Any], 
         source = "none"
 
     structured = {
-        "first_name": ocr_data.get("firstName", ""),
-        "middle_name": ocr_data.get("middleName", ""),
-        "last_name": ocr_data.get("lastName", ""),
-        "full_name": ocr_data.get("fullName", ""),
-        "document_number": ocr_data.get("idNumber", ""),
-        "document_type": ocr_data.get("idType", ""),
-        "date_of_birth": ocr_data.get("dateOfBirth", ""),
-        "expiry_date": ocr_data.get("expiryDate", ""),
-        "issue_date": ocr_data.get("issueDate", ""),
-        "address": ocr_data.get("address", ""),
+        "first_name": _guest_text(ocr_data.get("firstName", "")),
+        "middle_name": _guest_text(ocr_data.get("middleName", "")),
+        "last_name": _guest_text(ocr_data.get("lastName", "")),
+        "full_name": _guest_text(ocr_data.get("fullName", "")),
+        "document_number": _guest_text(ocr_data.get("idNumber", "")),
+        "document_type": _guest_text(ocr_data.get("idType", "")),
+        "date_of_birth": _guest_text(ocr_data.get("dateOfBirth", "")),
+        "expiry_date": _guest_text(ocr_data.get("expiryDate", "")),
+        "issue_date": _guest_text(ocr_data.get("issueDate", "")),
+        "address": _guest_text(ocr_data.get("address", "")),
         "street_address": "",
         "city": "",
         "state": "",
         "postal_code": "",
-        "gender": ocr_data.get("sex", ""),
+        "gender": _guest_text(ocr_data.get("sex", "")),
         "nationality": "",
         "mrz_raw": "",
         "barcode_data": {"source": source},
@@ -496,14 +604,48 @@ def _sdk_ok_to_document_result(sdk_ok: dict[str, Any], *, scan_mode: str) -> dic
     back_b64 = (sdk_ok.get("image_back_base64") or sdk_ok.get("back_image_base64") or "").strip()
     if not front_b64 and not back_b64:
         raise ValueError("nScan 690gt returned no image data")
+
+    front_bytes = base64.b64decode(front_b64) if front_b64 else b""
+    back_bytes = base64.b64decode(back_b64) if back_b64 else b""
+
     structured, aamva_raw = _decode_from_images(front_b64, back_b64)
-    return _build_result(
-        structured,
-        front_b64=front_b64,
-        back_b64=back_b64,
-        aamva_raw=aamva_raw,
-        scan_mode=scan_mode,
-    )
+    result: dict[str, Any] | None = None
+    for max_edge, quality in _JPEG_ATTEMPTS:
+        jpeg_front, jpeg_back = _compact_side_jpegs(
+            front_bytes, back_bytes, max_edge=max_edge, quality=quality,
+        )
+        if (front_bytes and not jpeg_front) or (back_bytes and not jpeg_back):
+            continue
+        result = _build_result(
+            structured,
+            front_b64=jpeg_front,
+            back_b64=jpeg_back,
+            aamva_raw=aamva_raw,
+            scan_mode=scan_mode,
+        )
+        n = _wire_size(result)
+        logger.info("%s outbound payload %d bytes (budget %d)", _LOG_TAG, n, _CHROME_PAYLOAD_BUDGET)
+        if n < _CHROME_PAYLOAD_BUDGET:
+            return result
+
+    if result is None:
+        result = _build_result(
+            structured, front_b64="", back_b64="", aamva_raw=aamva_raw, scan_mode=scan_mode,
+        )
+
+    # Last resort: keep ID fields + tiniest JPEGs, drop optional raw barcode text.
+    logger.warning("%s payload still large — dropping aamva_raw, keeping JPEG panels", _LOG_TAG)
+    result["aamva_raw"] = ""
+    bd = result.get("barcode_data")
+    if isinstance(bd, dict):
+        result["barcode_data"] = {"source": bd.get("source", "pdf417_aamva")}
+    doc = result.get("document_data")
+    if isinstance(doc, dict) and isinstance(doc.get("barcode_data"), dict):
+        src = doc["barcode_data"].get("source", "pdf417_aamva")
+        doc["barcode_data"] = {"source": src}
+    n = _wire_size(result)
+    logger.info("%s outbound payload after trim %d bytes", _LOG_TAG, n)
+    return result
 
 
 def build_auto_scan_payload(sdk_ok: dict[str, Any]) -> dict[str, Any]:

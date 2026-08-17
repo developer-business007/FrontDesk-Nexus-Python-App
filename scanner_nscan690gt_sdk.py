@@ -77,6 +77,9 @@ SIP_PREFEED_ENABLED = 50
 
 _LINES_PER_READ = 16
 _scanner_lock = threading.Lock()
+_PROBE_CACHE_S = 30.0
+_probe_cache: dict[str, Any] | None = None
+_probe_cache_at = 0.0
 
 
 def _resolve_dll_path() -> Path | None:
@@ -540,7 +543,14 @@ def wait_for_card_insert(*, poll_s: float = 0.35, stop_event: threading.Event | 
 
 
 def probe_nscan690gt_sdk() -> dict[str, Any]:
-    """Lightweight probe for DEVICE_STATUS."""
+    """
+    Lightweight probe for DEVICE_STATUS.
+
+    Never blocks a live scan: if the scanner lock is held, return the last good
+    result (or DLL-present) without calling SI_OpenInterface.
+    """
+    global _probe_cache, _probe_cache_at
+
     if sys.platform != "win32":
         return {"available": False, "hw_ok": False, "dll_path": "", "detail": "Windows only."}
     dll_path = _resolve_dll_path()
@@ -552,14 +562,32 @@ def probe_nscan690gt_sdk() -> dict[str, Any]:
             "detail": "NS690gt.DLL not found. Install nScan 690gt driver.",
         }
 
-    # Must take the same lock as scan/auto-watch so DEVICE_STATUS cannot
-    # SI_CloseInterface mid-poll / mid-scan (was causing 0x11 errors).
-    with _scanner_lock:
+    now = time.monotonic()
+    if _probe_cache is not None and (now - _probe_cache_at) < _PROBE_CACHE_S:
+        return dict(_probe_cache)
+
+    got = _scanner_lock.acquire(blocking=False)
+    if not got:
+        if _probe_cache is not None:
+            out = dict(_probe_cache)
+            out["detail"] = "nScan 690gt busy (scan/poll in progress)."
+            return out
+        return {
+            "available": True,
+            "hw_ok": True,
+            "dll_path": str(dll_path),
+            "detail": "NS690gt.DLL present; hardware busy (scan in progress).",
+        }
+
+    try:
         try:
             dll = _load_dll(dll_path)
             _bind(dll)
         except AmbirSDKError as exc:
-            return {"available": False, "hw_ok": False, "dll_path": str(dll_path), "detail": str(exc)}
+            result = {"available": False, "hw_ok": False, "dll_path": str(dll_path), "detail": str(exc)}
+            _probe_cache = result
+            _probe_cache_at = time.monotonic()
+            return result
 
         hw_ok = False
         note = "DLL loaded; hardware status unknown."
@@ -575,9 +603,14 @@ def probe_nscan690gt_sdk() -> dict[str, Any]:
             except Exception:  # noqa: BLE001
                 pass
 
-        return {
+        result = {
             "available": True,
             "hw_ok": hw_ok,
             "dll_path": str(dll_path),
             "detail": note,
         }
+        _probe_cache = result
+        _probe_cache_at = time.monotonic()
+        return result
+    finally:
+        _scanner_lock.release()
