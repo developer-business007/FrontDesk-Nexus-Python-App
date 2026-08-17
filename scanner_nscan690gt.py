@@ -540,6 +540,42 @@ def _opposite_180(rotate_cw: int) -> int:
     return (int(rotate_cw) + 180) % 360
 
 
+def _barcode_rotate_lower_half(raw_bytes: bytes, guessed: int) -> int:
+    """
+    First successful zxing variant is not a reliable 0° vs 180° (hotel logs
+    guessed 180 then 0 on the same CA DL). Pick the rotation where PDF417
+    sits in the lower half of the full raster.
+    """
+    from PIL import Image, ImageOps
+
+    try:
+        gray = ImageOps.exif_transpose(Image.open(io.BytesIO(raw_bytes))).convert("L")
+    except Exception:  # noqa: BLE001
+        return guessed
+    best_rot = guessed
+    best_frac = -1.0
+    for rot, img in ((0, gray), (180, gray.rotate(180, expand=True))):
+        try:
+            hits = _pdf417_candidates_from_pil(img)
+        except Exception:  # noqa: BLE001
+            continue
+        for _text, result in hits:
+            frac = _barcode_y_frac(result, img.size[1])
+            if frac is None:
+                continue
+            if frac > best_frac:
+                best_frac = frac
+                best_rot = rot
+            break
+    if best_frac >= 0:
+        logger.info(
+            "%s barcode lower-half lock guessed=%d locked=%d y_frac=%.2f",
+            _LOG_TAG, guessed, best_rot, best_frac,
+        )
+        return best_rot
+    return guessed
+
+
 def _orient_duplex_faces(
     side0: bytes,
     side1: bytes,
@@ -553,6 +589,7 @@ def _orient_duplex_faces(
     """
     s0, raw0, rot0 = _try_pdf417(side0) if side0 else (None, "", 0)
     if s0:
+        rot0 = _barcode_rotate_lower_half(side0, rot0)
         photo_rot = _opposite_180(rot0)
         logger.info(
             "%s duplex assign: barcode on DLL side0 rot=%d → FRONT rot=%d (opposite CIS)",
@@ -562,6 +599,7 @@ def _orient_duplex_faces(
 
     s1, raw1, rot1 = _try_pdf417(side1) if side1 else (None, "", 0)
     if s1:
+        rot1 = _barcode_rotate_lower_half(side1, rot1)
         photo_rot = _opposite_180(rot1)
         logger.info(
             "%s duplex assign: barcode on DLL side1 rot=%d → FRONT rot=%d (opposite CIS)",
