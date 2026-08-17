@@ -54,9 +54,10 @@ _JPEG_ATTEMPTS: tuple[tuple[int, int], ...] = (
     (420, 36),
     (320, 32),
 )
-# Duplex CIS sensors are 180° apart, so one face is already inverted vs the other.
-# BACK = the PDF417 face (rotated so the barcode reads). FRONT = the other face,
-# rotated the opposite way. Override both faces: FDN_NSCAN690GT_ROTATE_CW=180.
+# BACK = PDF417 face, oriented on its own (landscape, barcode lower, magstripe top).
+# FRONT = photo face, oriented on its own (landscape, header top, photo on the right).
+# Do not rotate FRONT as the opposite of BACK — insert direction breaks that.
+# Override both faces: FDN_NSCAN690GT_ROTATE_CW=180.
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -512,68 +513,158 @@ def _rotate_raster_cw(raw_bytes: bytes, degrees: int) -> bytes:
     return buf.getvalue()
 
 
-def _portrait_upright_score(raw_bytes: bytes, rotate_cw: int) -> float:
-    """
-    Higher when the top band looks like a DL header (text/edges) rather than the
-    bottom band. Used to pick 0° vs 180° for the photo side.
-    """
-    from PIL import Image, ImageFilter, ImageOps, ImageStat
-
-    img = Image.open(io.BytesIO(raw_bytes))
-    try:
-        img = ImageOps.exif_transpose(img)
-    except Exception:  # noqa: BLE001
-        pass
-    img = img.convert("L")
-    if rotate_cw:
-        img = img.rotate(-int(rotate_cw) % 360, expand=True)
-    w, h = img.size
-    if h < 20:
-        return 0.0
-    band = max(4, h // 5)
-    top = img.crop((0, 0, w, band)).filter(ImageFilter.FIND_EDGES)
-    bot = img.crop((0, h - band, w, h)).filter(ImageFilter.FIND_EDGES)
-    return float(ImageStat.Stat(top).mean[0]) - float(ImageStat.Stat(bot).mean[0])
-
-
-def _opposite_180(rotate_cw: int) -> int:
-    return (int(rotate_cw) + 180) % 360
-
-
-def _barcode_rotate_lower_half(raw_bytes: bytes, guessed: int) -> int:
-    """
-    First successful zxing variant is not a reliable 0° vs 180° (hotel logs
-    guessed 180 then 0 on the same CA DL). Pick the rotation where PDF417
-    sits in the lower half of the full raster.
-    """
+def _open_gray(raw_bytes: bytes):
     from PIL import Image, ImageOps
 
+    return ImageOps.exif_transpose(Image.open(io.BytesIO(raw_bytes))).convert("L")
+
+
+def _apply_cw(img: Any, rotate_cw: int) -> Any:
+    if not rotate_cw:
+        return img
+    return img.rotate(-int(rotate_cw) % 360, expand=True)
+
+
+def _edge_mean(im: Any) -> float:
+    from PIL import ImageFilter, ImageStat
+
+    return float(ImageStat.Stat(im.filter(ImageFilter.FIND_EDGES)).mean[0])
+
+
+def _dl_front_score(gray: Any, rotate_cw: int) -> float:
+    """
+    Upright US DL photo side: landscape, header text along the top, portrait
+    on the right (more edges on the left text column).
+    """
+    from PIL import ImageStat
+
+    img = _apply_cw(gray, rotate_cw)
+    w, h = img.size
+    if w < 16 or h < 16:
+        return -999.0
+    aspect = w / float(h)
+    landscape = 30.0 if aspect >= 1.15 else (-25.0 if aspect < 0.9 else 0.0)
+    band = max(4, h // 5)
+    header = _edge_mean(img.crop((0, 0, w, band))) - _edge_mean(img.crop((0, h - band, w, h)))
+    mid0, mid1 = int(h * 0.18), int(h * 0.88)
+    col = max(8, w // 3)
+    photo_on_right = _edge_mean(img.crop((0, mid0, col, mid1))) - _edge_mean(
+        img.crop((w - col, mid0, w, mid1))
+    )
+    # Darker top bar (state header) vs bottom footer.
+    top_dark = float(ImageStat.Stat(img.crop((0, h - band, w, h))).mean[0]) - float(
+        ImageStat.Stat(img.crop((0, 0, w, band))).mean[0]
+    )
+    return landscape + header + photo_on_right + 0.15 * top_dark
+
+
+def _photo_panel_rotation(raw_bytes: bytes) -> int:
+    if not raw_bytes:
+        return 0
     try:
-        gray = ImageOps.exif_transpose(Image.open(io.BytesIO(raw_bytes))).convert("L")
+        gray = _open_gray(raw_bytes)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("%s photo orient: cannot open image: %s", _LOG_TAG, exc)
+        return 0
+    scored: list[tuple[float, int]] = []
+    for rot in (0, 90, 180, 270):
+        scored.append((_dl_front_score(gray, rot), rot))
+    scored.sort(key=lambda item: item[0], reverse=True)
+    best_score, best_rot = scored[0]
+    logger.info(
+        "%s photo orient scores=%s → %d°",
+        _LOG_TAG,
+        ", ".join(f"{rot}:{score:.1f}" for score, rot in scored),
+        best_rot,
+    )
+    return best_rot
+
+
+def _barcode_corners(result: Any) -> tuple[list[float], list[float]]:
+    xs: list[float] = []
+    ys: list[float] = []
+    pos = getattr(result, "position", None)
+    if pos is None:
+        return xs, ys
+    for name in ("top_left", "top_right", "bottom_left", "bottom_right"):
+        pt = getattr(pos, name, None)
+        if pt is None:
+            continue
+        x = getattr(pt, "x", None)
+        if x is None:
+            x = getattr(pt, "X", None)
+        y = getattr(pt, "y", None)
+        if y is None:
+            y = getattr(pt, "Y", None)
+        try:
+            if x is not None:
+                xs.append(float(x))
+            if y is not None:
+                ys.append(float(y))
+        except (TypeError, ValueError):
+            pass
+    return xs, ys
+
+
+def _dl_back_score(gray: Any, rotate_cw: int) -> float | None:
+    """
+    Upright US DL barcode side: landscape, PDF417 horizontal and in the lower
+    half, magnetic stripe (dark band) near the top.
+    """
+    from PIL import ImageStat
+
+    img = _apply_cw(gray, rotate_cw)
+    w, h = img.size
+    if w < 16 or h < 16:
+        return None
+    try:
+        hits = _pdf417_candidates_from_pil(img)
+    except Exception:  # noqa: BLE001
+        return None
+    if not hits:
+        return None
+    _text, result = hits[0]
+    xs, ys = _barcode_corners(result)
+    yf = _barcode_y_frac(result, h)
+    if yf is None and ys:
+        yf = (sum(ys) / len(ys)) / float(h)
+    yf = 0.5 if yf is None else yf
+    bw = ((max(xs) - min(xs)) / float(w)) if xs else 0.0
+    bh = ((max(ys) - min(ys)) / float(h)) if ys else 0.0
+    landscape = 25.0 if w >= h else -25.0
+    horizontal = 20.0 if bw >= bh else -15.0
+    tband = max(4, h // 10)
+    stripe_top = float(ImageStat.Stat(img.crop((0, h - tband, w, h))).mean[0]) - float(
+        ImageStat.Stat(img.crop((0, 0, w, tband))).mean[0]
+    )
+    return landscape + horizontal + (yf - 0.5) * 50.0 + 0.25 * stripe_top
+
+
+def _barcode_panel_rotation(raw_bytes: bytes, guessed: int) -> int:
+    if not raw_bytes:
+        return guessed
+    try:
+        gray = _open_gray(raw_bytes)
     except Exception:  # noqa: BLE001
         return guessed
-    best_rot = guessed
-    best_frac = -1.0
-    for rot, img in ((0, gray), (180, gray.rotate(180, expand=True))):
-        try:
-            hits = _pdf417_candidates_from_pil(img)
-        except Exception:  # noqa: BLE001
+    scored: list[tuple[float, int]] = []
+    for rot in (0, 90, 180, 270):
+        score = _dl_back_score(gray, rot)
+        if score is None:
             continue
-        for _text, result in hits:
-            frac = _barcode_y_frac(result, img.size[1])
-            if frac is None:
-                continue
-            if frac > best_frac:
-                best_frac = frac
-                best_rot = rot
-            break
-    if best_frac >= 0:
-        logger.info(
-            "%s barcode lower-half lock guessed=%d locked=%d y_frac=%.2f",
-            _LOG_TAG, guessed, best_rot, best_frac,
-        )
-        return best_rot
-    return guessed
+        scored.append((score, rot))
+    if not scored:
+        return guessed
+    scored.sort(key=lambda item: item[0], reverse=True)
+    best_score, best_rot = scored[0]
+    logger.info(
+        "%s barcode orient guessed=%d scores=%s → %d°",
+        _LOG_TAG,
+        guessed,
+        ", ".join(f"{rot}:{score:.1f}" for score, rot in scored),
+        best_rot,
+    )
+    return best_rot
 
 
 def _orient_duplex_faces(
@@ -583,42 +674,37 @@ def _orient_duplex_faces(
     """
     DLL side 0/1 is insert-order, not photo vs barcode.
 
-    BACK = the raster with PDF417/AAMVA, rotated so the barcode is readable.
-    FRONT = the other raster, rotated 180° relative to BACK (the two CIS
-    units face opposite directions).
+    BACK = the raster with PDF417/AAMVA (oriented from barcode layout).
+    FRONT = the other raster (oriented from DL photo layout). Each side is
+    scored independently so insert-backwards does not invert the portrait.
     """
     s0, raw0, rot0 = _try_pdf417(side0) if side0 else (None, "", 0)
     if s0:
-        rot0 = _barcode_rotate_lower_half(side0, rot0)
-        photo_rot = _opposite_180(rot0)
+        rot_back = _barcode_panel_rotation(side0, rot0)
+        rot_front = _photo_panel_rotation(side1)
         logger.info(
-            "%s duplex assign: barcode on DLL side0 rot=%d → FRONT rot=%d (opposite CIS)",
-            _LOG_TAG, rot0, photo_rot,
+            "%s duplex assign: barcode on DLL side0 — BACK rot=%d FRONT rot=%d",
+            _LOG_TAG, rot_back, rot_front,
         )
-        return _rotate_raster_cw(side1, photo_rot), _rotate_raster_cw(side0, rot0), s0, raw0
+        return _rotate_raster_cw(side1, rot_front), _rotate_raster_cw(side0, rot_back), s0, raw0
 
     s1, raw1, rot1 = _try_pdf417(side1) if side1 else (None, "", 0)
     if s1:
-        rot1 = _barcode_rotate_lower_half(side1, rot1)
-        photo_rot = _opposite_180(rot1)
+        rot_back = _barcode_panel_rotation(side1, rot1)
+        rot_front = _photo_panel_rotation(side0)
         logger.info(
-            "%s duplex assign: barcode on DLL side1 rot=%d → FRONT rot=%d (opposite CIS)",
-            _LOG_TAG, rot1, photo_rot,
+            "%s duplex assign: barcode on DLL side1 — BACK rot=%d FRONT rot=%d",
+            _LOG_TAG, rot_back, rot_front,
         )
-        return _rotate_raster_cw(side0, photo_rot), _rotate_raster_cw(side1, rot1), s1, raw1
+        return _rotate_raster_cw(side0, rot_front), _rotate_raster_cw(side1, rot_back), s1, raw1
 
-    rot_a = 0
-    if side0:
-        s_a0 = _portrait_upright_score(side0, 0)
-        s_a180 = _portrait_upright_score(side0, 180)
-        rot_a = 180 if s_a180 > s_a0 else 0
-        logger.info(
-            "%s duplex assign: no PDF417 — FRONT from DLL side0 rot=%d (score0=%.1f score180=%.1f)",
-            _LOG_TAG, rot_a, s_a0, s_a180,
-        )
-    else:
-        logger.info("%s duplex assign: no PDF417 — keep DLL order", _LOG_TAG)
-    return _rotate_raster_cw(side0, rot_a), _rotate_raster_cw(side1, _opposite_180(rot_a)), None, ""
+    rot_front = _photo_panel_rotation(side0) if side0 else 0
+    rot_back = _photo_panel_rotation(side1) if side1 else 0
+    logger.info(
+        "%s duplex assign: no PDF417 — FRONT rot=%d BACK rot=%d (layout score)",
+        _LOG_TAG, rot_front, rot_back,
+    )
+    return _rotate_raster_cw(side0, rot_front), _rotate_raster_cw(side1, rot_back), None, ""
 
 
 def _to_jpeg_b64(raw_bytes: bytes, *, max_edge: int, quality: int) -> str:
