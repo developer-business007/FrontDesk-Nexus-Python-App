@@ -533,29 +533,28 @@ def _edge_mean(im: Any) -> float:
 
 def _dl_front_score(gray: Any, rotate_cw: int) -> float:
     """
-    Upright US DL photo side: landscape, header text along the top, portrait
-    on the right (more edges on the left text column).
+    Upright US DL/ID photo side: landscape, state header along the top,
+    portrait on the LEFT (TX and most REAL IDs). Photo-on-right was wrong
+    and made Texas scans pick 180°.
     """
-    from PIL import ImageStat
-
     img = _apply_cw(gray, rotate_cw)
     w, h = img.size
     if w < 16 or h < 16:
         return -999.0
     aspect = w / float(h)
-    landscape = 30.0 if aspect >= 1.15 else (-25.0 if aspect < 0.9 else 0.0)
+    landscape = 40.0 if aspect >= 1.15 else (-30.0 if aspect < 0.9 else 0.0)
     band = max(4, h // 5)
-    header = _edge_mean(img.crop((0, 0, w, band))) - _edge_mean(img.crop((0, h - band, w, h)))
+    # Printed "TEXAS" / state header has more edges than the card footer.
+    header = 2.0 * (
+        _edge_mean(img.crop((0, 0, w, band))) - _edge_mean(img.crop((0, h - band, w, h)))
+    )
     mid0, mid1 = int(h * 0.18), int(h * 0.88)
     col = max(8, w // 3)
-    photo_on_right = _edge_mean(img.crop((0, mid0, col, mid1))) - _edge_mean(
-        img.crop((w - col, mid0, w, mid1))
-    )
-    # Darker top bar (state header) vs bottom footer.
-    top_dark = float(ImageStat.Stat(img.crop((0, h - band, w, h))).mean[0]) - float(
-        ImageStat.Stat(img.crop((0, 0, w, band))).mean[0]
-    )
-    return landscape + header + photo_on_right + 0.15 * top_dark
+    left = img.crop((0, mid0, col, mid1))
+    right = img.crop((w - col, mid0, w, mid1))
+    # Portrait is smoother than the data column, so the RIGHT third has more edges.
+    photo_on_left = _edge_mean(right) - _edge_mean(left)
+    return landscape + header + photo_on_left
 
 
 def _photo_panel_rotation(raw_bytes: bytes) -> int:
